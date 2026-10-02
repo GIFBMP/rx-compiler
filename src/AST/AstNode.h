@@ -131,15 +131,15 @@ struct Crate : public AstNode {
 enum class UnaryOp {Neg, Not, Deref, Ref, RefMut}; //-x !x *x &x &mut x
 
 enum class BinaryOp {
-    Add, Sub, Mul, Div, Rem,        //+ - * / %
+    Add, Sub, Mul, Div, Mod,        //+ - * / %
     BitAnd, BitOr, BitXor, Shl, Shr,//& | ^ << >>
     Eq, Ne, Lt, Le, Gt, Ge,         //== != < <= > >=
-    And, Or                         //&& ||
+    LogicalAnd, LogicalOr           //&& ||
 };
 
 enum class AssignOp {
     Assign,                        // =
-    Add, Sub, Mul, Div, Rem,       // += -= *= /= %=
+    Add, Sub, Mul, Div, Mod,       // += -= *= /= %=
     BitAnd, BitOr, BitXor, Shl, Shr// &= |= ^= <<= >>=
 };
 
