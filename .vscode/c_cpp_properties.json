@@ -1,0 +1,16 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/grammar",
+                "${workspaceFolder}/src",
+                "/usr/include/antlr4-runtime"
+            ],
+            "cppStandard": "c++17",
+            "cStandard": "c17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ]
+}

@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - -I/usr/include/antlr4-runtime
+    - -I/home/gifbmp/rx-compiler/grammar
+    - -I/home/gifbmp/rx-compiler/src
+    - -std=c++17
