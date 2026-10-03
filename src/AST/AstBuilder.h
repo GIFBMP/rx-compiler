@@ -14,9 +14,10 @@ public:
     explicit AstBuilder(std::string prog);
     NodePtr<Crate> build(RxParser::CrateContext *ctx);
     static     NodePtr<Crate> parse(const std::string &src);
+    static NodePtr<AstNode> parseEntry(const std::string &src, const std::string &entry);
 
 private:
-    std::string prog;
+    std::string program;
 
     std::string text(antlr4::tree::ParseTree *tree);
     std::string text(antlr4::Token *tok);
@@ -57,9 +58,9 @@ private:
     NodePtr<Type> buildClosedCastType(RxParser::ClosedCastTypeContext *ctx);
     NodePtr<Type> buildGenericArg(RxParser::GenericArgContext *ctx);
 
-    NodePtr<Expr> buildPathInExpression(RxParser::PathInExpressionContext *ctx);
+    NodePtr<PathExpr> buildPathInExpression(RxParser::PathInExpressionContext *ctx);
     PathSegment buildPathIdentSegment(RxParser::PathIdentSegmentContext *ctx);
-    PathSegment buildPathSegment(RxParser::PathExprSegmentContext *ctx);
+    PathSegment buildPathExprSegment(RxParser::PathExprSegmentContext *ctx);
     PathSegment buildTypePathSegment(RxParser::TypePathSegmentContext *ctx);
     std::vector<NodePtr<Type>> buildGenericArgs(RxParser::GenericArgsContext *ctx);
 
@@ -69,10 +70,6 @@ private:
     NodePtr<FuncParam> buildFunctionParam(RxParser::FunctionParamContext *ctx);
     std::pair<std::string, bool> buildIdentifierBinding(RxParser::IdentifierBindingContext *ctx);
     std::vector<Derive> buildDerives(std::vector<RxParser::OuterAttributeContext *> ctxs);
-
-    NodePtr<Expr> applyPostfixSuffix(NodePtr<Expr> base, RxParser::PostfixSuffixContext *ctx);
-    NodePtr<Expr> buildDotSuffix(NodePtr<Expr> base, RxParser::DotSuffixContext *ctx);
-    std::vector<NodePtr<Expr>> buildCallArguments(RxParser::CallArgumentsContext *ctx);
 
     NodePtr<Expr> binary(BinaryOp op, NodePtr<Expr> lhs, NodePtr<Expr> rhs);
 
