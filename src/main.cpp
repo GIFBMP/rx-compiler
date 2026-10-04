@@ -7,6 +7,7 @@
 #include "RxLexer.h"
 #include "RxParser.h"
 #include "AST/AstBuilder.h"
+#include "AST/AstCheck.h"
 #include "AST/AstDumper.h"
 
 static std::string readAll(std::istream &in) {
@@ -18,11 +19,15 @@ static std::string readAll(std::istream &in) {
 int main(int argc, char **argv) {
     std::string entry = "crate";
     std::string path;
+    bool checkMode = false;
 
     for(int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if(arg == "--entry" && i + 1 < argc) {
             entry = argv[++i];
+        }
+        else if(arg == "--check") {
+            checkMode = true;
         }
         else {
             path = arg;
@@ -46,6 +51,20 @@ int main(int argc, char **argv) {
     if(!ast) {
         std::cerr << "parse/build failed (entry=" << entry << ")\n";
         return 1;
+    }
+
+    if(checkMode) {
+        std::vector<std::string> errors = astcheck::check(ast.get());
+        if(!errors.empty()) {
+            for(size_t i = 0; i < errors.size() && i < 10; i++) {
+                std::cerr << "CHECK: " << errors[i] << "\n";
+            }
+            if(errors.size() > 10) {
+                std::cerr << "CHECK: ... " << (errors.size() - 10) << " more\n";
+            }
+            return 3;
+        }
+        return 0;
     }
 
     std::cout << "AST OK (entry=" << entry << ")\n";

@@ -1936,8 +1936,17 @@ NodePtr<BlockExpr> AstBuilder::buildBlockExpr(RxParser::BlockExpressionContext *
     if(ctx->statementExpression()) {
         ret->tail = buildStatementExpr(ctx->statementExpression());
     }
-    for(auto *sta: ctx->statement()) {
-        ret->statements.push_back(buildStatement(sta));
+    const auto &stmts = ctx->statement();
+    for(size_t i = 0; i < stmts.size(); i++) {
+        bool lastNoSemiBlock = (i + 1 == stmts.size())
+                               && stmts[i]->expressionWithBlock()
+                               && !stmts[i]->SEMI();
+        if(ret->tail == nullptr && lastNoSemiBlock) {
+            ret->tail = buildExpressionWithBlock(stmts[i]->expressionWithBlock());
+        }
+        else {
+            ret->statements.push_back(buildStatement(stmts[i]));
+        }
     }
     return ret;
 }
