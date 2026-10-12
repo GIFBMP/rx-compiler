@@ -18,6 +18,7 @@ static std::string readAll(std::istream &in) {
 
 int main(int argc, char **argv) {
     std::string entry = "crate";
+    std::string stage;
     std::string path;
     bool checkMode = false;
 
@@ -25,6 +26,9 @@ int main(int argc, char **argv) {
         std::string arg = argv[i];
         if(arg == "--entry" && i + 1 < argc) {
             entry = argv[++i];
+        }
+        else if(arg == "--stage" && i + 1 < argc) {
+            stage = argv[++i];
         }
         else if(arg == "--check") {
             checkMode = true;
@@ -47,9 +51,17 @@ int main(int argc, char **argv) {
         src = readAll(std::cin);
     }
 
-    NodePtr<AstNode> ast = AstBuilder::parseEntry(src, entry);
+    NodePtr<AstNode> ast = AstBuilder::parseEntry(src, stage.empty() ? entry : "crate");
     if(!ast) {
         std::cerr << "parse/build failed (entry=" << entry << ")\n";
+        return 1;
+    }
+
+    if(!stage.empty()) {
+        if(stage == "parse") {
+            return 0;
+        }
+        std::cerr << "unsupported stage: " << stage << "\n";
         return 1;
     }
 

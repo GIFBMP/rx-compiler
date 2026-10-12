@@ -11,6 +11,8 @@ add_subdirectory(grammar)
 add_executable(rxc
     src/main.cpp
     src/AST/AstBuilder.cpp
+    src/semantic/analyzer.cpp
+    src/semantic/constEval.cpp
 )
 
 target_include_directories(rxc PRIVATE src)
