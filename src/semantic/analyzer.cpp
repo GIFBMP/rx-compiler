@@ -1,5 +1,6 @@
 #include "analyzer.h"
 #include "AST/type.h"
+#include "semantic/symbol.h"
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
@@ -85,35 +86,39 @@ void SemanticAnalyzer::collectItems(Crate *crate) {
 
     //Collect constant names first, resolve it when needed
 
+    //Phase 1
+
     for(auto &it: crate->items) {
         if(it->typ == NodeType::ConstItem) {
             collectConst(static_cast<ConstItem*>(it.get()));
         }
-    }//1b global consts
+    }
 
     for(auto &it: crate->items) {
         if(it->typ == NodeType::StructDefItem) {
             collectStructBody(static_cast<StructDefItem*>(it.get()));
         }
-    }//1c struct fields
+    }
 
     for(auto &it: crate->items) {
         if(it->typ == NodeType::FuncDefItem) {
             collectFunc(static_cast<FuncDefItem*>(it.get()));
         }
-    }//1d function signatures
+    }
 
     for(auto &it: crate->items) {
         if(it->typ == NodeType::ImplItem) {
             collectImpl(static_cast<ImplItem*>(it.get()));
         }
-    }//1e impl
+    }
 
     for(auto &pair: globals_) {
         if(pair.second->kind == SymbolKind::Const) {
             evaluateConst(pair.second);
         }
-    }//1f uniformly evaluate global consts
+    }//calculate constants
+
+    //TODO: Phase2: check concrete semantics
 }
 
 void SemanticAnalyzer::collectStructNames(Crate *crate) {
@@ -405,8 +410,52 @@ SemTypePtr SemanticAnalyzer::checkType(Type *type) {
 }
 
 SemTypePtr SemanticAnalyzer::checkPathType(PathType *type) {
-    (void)type;
-    return SemType::makeError();
+    if(type->segments.empty()) {
+        error(type->span, "empty type path");
+        return SemType::makeError();
+    }
+    if(type->segments.size() > 1) {//multi type path is not allowed in Rx according to spec
+        error(type->span, "multi type path");
+        return SemType::makeError();
+    }
+    const PathSegment &seg = type->segments[0];
+    if(seg.isSelf) {//self
+        error(type->span, "self is not a type");
+        return SemType::makeError();
+    }
+    if(seg.isSelfType) {//Self
+        if(!seg.typeArgs.empty()) {//Rx does not support
+            error(type->span, "Self shouldn't include type args");
+            return SemType::makeError();
+        }
+        if(currentImplSelf_ == nullptr) {
+            error(type->span, "Self outside a struct or an impl");
+            return SemType::makeError();
+        }
+        return SemType::makeStruct(currentImplSelf_);
+    }
+    //TODO
+    Symbol *sym = lookupType(seg.ident);
+
+    if(sym == nullptr) {
+        error(type->span, "unknown type");
+        return SemType::makeError();
+    }
+
+    if(sym->kind == SymbolKind::BuiltinType && sym->type == nullptr) {//Vec and Box
+        if(seg.typeArgs.size() != 1) {
+            error(type->span, "Box/Vec should include exactly one type arg");
+            return SemType::makeError();
+        }
+        SemKind nw = seg.ident == "Vec" ? SemKind::Vec : SemKind::Box;
+        return SemType::makeContainer(nw, checkType(seg.typeArgs[0].get()));
+    }
+
+    if(!seg.typeArgs.empty()) {
+        error(type->span, seg.ident + " shouldn't include type args");
+        return SemType::makeError();
+    }
+    return sym->type;
 }
 
 Symbol *SemanticAnalyzer::declareType(std::unique_ptr<Symbol> sym) {
@@ -451,16 +500,19 @@ void SemanticAnalyzer::error(SourceSpan span, std::string message) {
 
 void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
     (void)item;
+    //TODO
 }
 
 void SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
     (void)stmt;
     (void)scope;
+    //TODO
 }
 
 SemTypePtr SemanticAnalyzer::checkExpr(Expr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)expr;
     (void)scope;
     (void)expected;
+    //TODO
     return SemType::makeError();
 }
