@@ -1,6 +1,7 @@
 #include "analyzer.h"
 #include "AST/type.h"
 #include "semantic/symbol.h"
+#include <set>
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
@@ -10,6 +11,7 @@ bool SemanticAnalyzer::analyze(Crate *crate) {
     initBuiltins();
     constEval_.setAnalyzer(this);
     collectItems(crate);
+    checkEntry();
     return !hasError();
 }
 
@@ -100,6 +102,9 @@ void SemanticAnalyzer::collectItems(Crate *crate) {
         }
     }
 
+    checkLayoutCycles();
+    checkDerives();
+
     for(auto &it: crate->items) {
         if(it->typ == NodeType::FuncDefItem) {
             collectFunc(static_cast<FuncDefItem*>(it.get()));
@@ -142,6 +147,10 @@ void SemanticAnalyzer::collectStructNames(Crate *crate) {
 void SemanticAnalyzer::collectStructBody(StructDefItem *item) {
     StructInfo &info = structs_[item];
     info.def = item;
+
+    const StructDefItem *saved = currentImplSelf_;
+    currentImplSelf_ = item;
+
     std::unordered_set<std::string> vis;
     for(auto &it: item->fields) {
         auto *field = it.get();
@@ -152,6 +161,8 @@ void SemanticAnalyzer::collectStructBody(StructDefItem *item) {
         info.fields.push_back({field->name, tmp, field->span});
     }
     info.derives = item->derives;
+
+    currentImplSelf_ = saved;
 }
 
 void SemanticAnalyzer::collectFunc(FuncDefItem *item) {
@@ -243,18 +254,10 @@ void SemanticAnalyzer::collectConstInImpl(ConstItem *item, StructInfo &info) {
 
 void SemanticAnalyzer::collectImpl(ImplItem *item) {
     const StructDefItem *selfDef = nullptr;
-    /*
-    Attention:
-    isSelf: self
-    isSelfType: Self
-    */
-    if(item->selfType && item->selfType->typ == NodeType::PathType) {
-        auto *path = static_cast<PathType *>(item->selfType.get());
-        if(path->segments.size() == 1 && !path->segments[0].isSelf && !path->segments[0].isSelfType) {
-            Symbol *sym = lookupType(path->segments[0].ident);
-            if(sym != nullptr && sym->kind == SymbolKind::Struct) {
-                selfDef = static_cast<const StructDefItem *>(sym->decl);
-            }
+    if(item->selfType) {
+        SemTypePtr target = checkType(item->selfType.get());
+        if(target && target->kind == SemKind::Struct) {
+            selfDef = target->structDef;
         }
     }
     if(selfDef == nullptr) {
@@ -287,27 +290,29 @@ void SemanticAnalyzer::collectImpl(ImplItem *item) {
     currentImplSelf_ = saved;
 }
 
-const Symbol *SemanticAnalyzer::resolveConstPath(const PathExpr *path) {
-    if(path == nullptr || path->segments.empty()) {
-        error(path ? path->span : SourceSpan{}, "invalid constant path");
+const Symbol *SemanticAnalyzer::resolveConstPath(const PathExpr *path, bool report) {//const def like xxx = Self::/A::
+    SourceSpan span = path ? path->span : SourceSpan{};
+    auto fail = [&](std::string message) -> const Symbol * {
+        if(report) error(span, std::move(message));
         return nullptr;
+    };
+
+    if(path == nullptr || path->segments.empty()) {
+        return fail("invalid constant path");
     }
 
     const PathSegment &first = path->segments[0];
 
     if(path->segments.size() == 1) {
         if(first.isSelf || first.isSelfType) {
-            error(path->span, "invalid constant path");
-            return nullptr;
+            return fail("invalid constant path");
         }
         Symbol *sym = lookupValue(first.ident);
         if(sym == nullptr) {
-            error(path->span, "unresolved constant: " + first.ident);
-            return nullptr;
+            return fail("unresolved constant: " + first.ident);
         }
         if(sym->kind != SymbolKind::Const) {
-            error(path->span, first.ident + " is not a constant");
-            return nullptr;
+            return fail(first.ident + " is not a constant");
         }
         return sym;
     }
@@ -318,8 +323,7 @@ const Symbol *SemanticAnalyzer::resolveConstPath(const PathExpr *path) {
             def = currentImplSelf_;
         }
         else if(first.isSelf) {
-            error(path->span, "self:: path is not allowed");
-            return nullptr;
+            return fail("self:: path is not allowed");
         }
         else {
             Symbol *t = lookupType(first.ident);
@@ -328,33 +332,27 @@ const Symbol *SemanticAnalyzer::resolveConstPath(const PathExpr *path) {
             }
         }
         if(def == nullptr) {
-            error(path->span, "constant path does not name a user-defined struct");
-            return nullptr;
+            return fail("constant path does not name a user-defined struct");
         }
         const PathSegment &second = path->segments[1];
         if(second.isSelf || second.isSelfType || !second.typeArgs.empty()) {
-            error(path->span, "invalid constant path");
-            return nullptr;
+            return fail("invalid constant path");
         }
         auto sit = structs_.find(def);
         if(sit == structs_.end()) {
-            error(path->span, "constant path does not name an associated constant");
-            return nullptr;
+            return fail("constant path does not name an associated constant");
         }
         auto mit = sit->second.members.find(second.ident);
         if(mit == sit->second.members.end()) {
-            error(path->span, "no associated item: " + second.ident);
-            return nullptr;
+            return fail("no associated item: " + second.ident);
         }
         if(mit->second->kind != SymbolKind::AssocConst) {
-            error(path->span, second.ident + " is not an associated constant");
-            return nullptr;
+            return fail(second.ident + " is not an associated constant");
         }
         return mit->second;
     }
 
-    error(path->span, "invalid constant path");
-    return nullptr;
+    return fail("invalid constant path");
 }
 
 void SemanticAnalyzer::evaluateConst(Symbol *sym) {
@@ -371,10 +369,180 @@ void SemanticAnalyzer::checkConstValueType(const Symbol *sym, const ConstValue &
         if(type->kind != SemKind::Bool) {
             error(sym->span, "constant value type does not match declared type");
         }
+        return;
     }
-    else {
-        if(!type->isInteger()) {
-            error(sym->span, "constant value type does not match declared type");
+    if(!type->isInteger()) {
+        error(sym->span, "constant value type does not match declared type");
+        return;
+    }
+    switch(value.val.suffix) {
+        case IntSuffix::Infer: break;
+        case IntSuffix::I32:   if(type->kind != SemKind::I32)   error(sym->span, "constant initializer type does not match declared type"); break;
+        case IntSuffix::U32:   if(type->kind != SemKind::U32)   error(sym->span, "constant initializer type does not match declared type"); break;
+        case IntSuffix::Isize: if(type->kind != SemKind::Isize) error(sym->span, "constant initializer type does not match declared type"); break;
+        case IntSuffix::Usize: if(type->kind != SemKind::Usize) error(sym->span, "constant initializer type does not match declared type"); break;
+    }
+}
+
+bool SemanticAnalyzer::constExprIsUsize(const Expr *expr) {
+    if(expr == nullptr) return false;
+    switch(expr->typ) {        case NodeType::IntExpr: {
+            IntSuffix suffix = static_cast<const IntExpr*>(expr)->val.suffix;
+            return suffix == IntSuffix::Infer || suffix == IntSuffix::Usize;
+        }
+        case NodeType::GroupExpr:
+            return constExprIsUsize(static_cast<const GroupExpr*>(expr)->inner.get());
+        case NodeType::UnaryExpr:
+            return false;
+        case NodeType::PathExpr: {
+            const Symbol *sym = resolveConstPath(static_cast<const PathExpr*>(expr), false);
+            if(sym == nullptr || !sym->type || sym->type->isError()) return true;
+            return sym->type->kind == SemKind::Usize;
+        }
+        default:
+            return true;
+    }
+}
+
+void SemanticAnalyzer::checkEntry() {
+    Symbol *mainSym = lookupValue("main");
+    if(mainSym == nullptr || mainSym->kind != SymbolKind::Fn) {
+        error(SourceSpan{}, "an executable requires a top-level fn main");
+        return;
+    }
+    const auto *decl = static_cast<const FuncDefItem*>(mainSym->decl);
+    if(decl != nullptr && !decl->genericParams.empty()) {
+        error(mainSym->span, "main cannot have generic parameters");
+    }
+    const FuncSig *sig = funcSig(mainSym);
+    if(sig == nullptr) return;
+    if(!sig->params.empty()) {
+        error(mainSym->span, "main cannot have value parameters");
+    }
+    if(sig->ret && sig->ret->kind != SemKind::Unit) {
+        error(mainSym->span, "main must return unit");
+    }
+}
+
+void SemanticAnalyzer::collectInlineStructs(const SemTypePtr &type, std::vector<const StructDefItem *> &out) {
+    if(!type) return;
+    switch(type->kind) {
+        case SemKind::Struct:
+            if(type->structDef) out.push_back(type->structDef);
+            break;
+        case SemKind::Array:
+            collectInlineStructs(type->elem, out);
+            break;
+        default:
+            break;
+    }
+}
+
+bool SemanticAnalyzer::layoutDfs(const StructDefItem *def, std::unordered_map<const StructDefItem *, int> &color) {
+    color[def] = 1;
+    const StructInfo *info = structInfo(def);
+    if(info) {
+        for(auto &field : info->fields) {
+            std::vector<const StructDefItem *> children;
+            collectInlineStructs(field.type, children);
+            for(const StructDefItem *child : children) {
+                auto it = color.find(child);
+                int c = (it == color.end()) ? 0 : it->second;
+                if(c == 1) {
+                    error(def->span, "recursive inline layout");
+                    return true;
+                }
+                if(c == 0 && layoutDfs(child, color)) return true;
+            }
+        }
+    }
+    color[def] = 2;
+    return false;
+}
+
+void SemanticAnalyzer::checkLayoutCycles() {
+    std::unordered_map<const StructDefItem *, int> color;
+    for(auto &kv : structs_) {
+        auto it = color.find(kv.first);
+        if(it == color.end() || it->second == 0) {
+            if(layoutDfs(kv.first, color)) return;
+        }
+    }
+}
+
+bool SemanticAnalyzer::structHasDerive(const StructDefItem *def, Derive d) const {
+    auto it = structs_.find(def);
+    if(it == structs_.end()) return false;
+    for(Derive x : it->second.derives) {
+        if(x == d) return true;
+    }
+    return false;
+}
+
+bool SemanticAnalyzer::typeSupportsDerive(const SemTypePtr &type, Derive d,
+        std::set<std::pair<const StructDefItem *, Derive>> &inprogress) {
+    if(!type || type->isError()) return true;
+    switch(type->kind) {
+        case SemKind::I32: case SemKind::U32: case SemKind::Isize:
+        case SemKind::Usize: case SemKind::Bool: case SemKind::Unit: case SemKind::Never:
+            return true;
+        case SemKind::Ref:
+            if(d == Derive::Copy || d == Derive::Clone) return !type->isMut;
+            return typeSupportsDerive(type->inner, d, inprogress);
+        case SemKind::Array:
+            return typeSupportsDerive(type->elem, d, inprogress);
+        case SemKind::Box:
+        case SemKind::Vec:
+            if(d == Derive::Copy) return false;
+            return typeSupportsDerive(type->inner, d, inprogress);
+        case SemKind::Struct: {
+            const StructDefItem *def = type->structDef;
+            if(!structHasDerive(def, d)) return false;
+            auto key = std::make_pair(def, d);
+            if(inprogress.count(key)) return true;
+            inprogress.insert(key);
+            bool ok = true;
+            const StructInfo *info = structInfo(def);
+            if(info) {
+                for(auto &field : info->fields) {
+                    if(!typeSupportsDerive(field.type, d, inprogress)) { ok = false; break; }
+                }
+            }
+            inprogress.erase(key);
+            return ok;
+        }
+        default:
+            return true;
+    }
+}
+
+void SemanticAnalyzer::checkDerives() {
+    for(auto &kv : structs_) {
+        const StructDefItem *def = kv.first;
+        StructInfo &info = kv.second;
+
+        std::unordered_set<int> seen;
+        bool hasCopy = false, hasClone = false, hasEq = false, hasPartialEq = false;
+        for(Derive d : info.derives) {
+            if(!seen.insert(static_cast<int>(d)).second) {
+                error(def->span, "repeated derive entry");
+            }
+            if(d == Derive::Copy) hasCopy = true;
+            else if(d == Derive::Clone) hasClone = true;
+            else if(d == Derive::Eq) hasEq = true;
+            else if(d == Derive::PartialEq) hasPartialEq = true;
+        }
+        if(hasCopy && !hasClone) error(def->span, "Copy requires Clone");
+        if(hasEq && !hasPartialEq) error(def->span, "Eq requires PartialEq");
+
+        std::set<std::pair<const StructDefItem *, Derive>> inprogress;
+        for(Derive d : info.derives) {
+            for(auto &field : info.fields) {
+                if(!typeSupportsDerive(field.type, d, inprogress)) {
+                    error(def->span, "a field does not support the requested derive");
+                    break;
+                }
+            }
         }
     }
 }
@@ -391,6 +559,10 @@ SemTypePtr SemanticAnalyzer::checkType(Type *type) {
             auto len = constEval_.eval(arr->len.get());
             if(!len || len->kind != ConstKind::Int) {
                 error(arr->span, "array length is not an integer const");
+                return SemType::makeError();
+            }
+            if(!constExprIsUsize(arr->len.get())) {
+                error(arr->span, "array length must have usize type");
                 return SemType::makeError();
             }
             return SemType::makeArray(checkType(arr->elem.get()), static_cast<std::size_t>(len->val.val));
@@ -434,7 +606,6 @@ SemTypePtr SemanticAnalyzer::checkPathType(PathType *type) {
         }
         return SemType::makeStruct(currentImplSelf_);
     }
-    //TODO
     Symbol *sym = lookupType(seg.ident);
 
     if(sym == nullptr) {

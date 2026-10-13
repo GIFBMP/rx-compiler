@@ -9,8 +9,10 @@
 #include "semtype.h"
 #include "symbol.h"
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct Diagnostic {
@@ -67,9 +69,22 @@ private:
     void collectConstInImpl(ConstItem *item, StructInfo &info);
     void collectImpl(ImplItem *item);
 
-    const Symbol *resolveConstPath(const PathExpr *path);
+    const Symbol *resolveConstPath(const PathExpr *path, bool report = true);
     void evaluateConst(Symbol *sym);
     void checkConstValueType(const Symbol *sym, const ConstValue &value);
+    bool constExprIsUsize(const Expr *expr);
+
+    void checkLayoutCycles();
+    bool layoutDfs(const StructDefItem *def,
+                   std::unordered_map<const StructDefItem *, int> &color);
+    void collectInlineStructs(const SemTypePtr &type, std::vector<const StructDefItem *> &out);
+
+    void checkDerives();
+    bool structHasDerive(const StructDefItem *def, Derive d) const;
+    bool typeSupportsDerive(const SemTypePtr &type, Derive d,
+                            std::set<std::pair<const StructDefItem *, Derive>> &inprogress);
+
+    void checkEntry();
 
     SemTypePtr checkType(Type *type);
     SemTypePtr checkPathType(PathType *type);

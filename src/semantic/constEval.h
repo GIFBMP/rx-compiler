@@ -18,6 +18,17 @@ struct ConstValue {
     IntValue val;
 
     bool boolVal = false;
+
+    static ConstValue makeIntValue(const IntValue &v) {
+        return ConstValue{ConstKind::Int, v, false};
+    }
+
+    static ConstValue makeBoolValue(bool b) {
+        return ConstValue{ConstKind::Bool, IntValue{}, b};
+    }
+
+    bool isInt() const { return kind == ConstKind::Int; }
+    bool isBool() const { return kind == ConstKind::Bool; }
 };
 
 class ConstEvaluator {
@@ -32,4 +43,5 @@ private:
 
     std::unordered_map<const Symbol *, ConstValue> memo_;
     std::unordered_set<const Symbol *> visiting_;
+    std::unordered_set<const Symbol *> failed_;
 };

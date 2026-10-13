@@ -21,6 +21,7 @@ struct FuncParam : public AstNode {
 
 struct FuncDefItem : public Item {
     std::string name;
+    std::string genericParams;
     std::vector<NodePtr<FuncParam>> params;
     NodePtr<Type> returnType;
     NodePtr<BlockExpr> body;

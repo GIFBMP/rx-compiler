@@ -634,6 +634,7 @@ NodePtr<Item> AstBuilder::buildFunctionDefinition(RxParser::FunctionDefinitionCo
     auto ret = std::make_unique<FuncDefItem>(spanOf(ctx));
     ret->body = buildBlockExpr(ctx->blockExpression());
     ret->name = ident(ctx->identifier());
+    ret->genericParams = ctx->genericParams() ? ctx->genericParams()->getText() : std::string();
     ret->params = ctx->functionParameters() ? \
                   buildFunctionParameters(ctx->functionParameters()) : std::vector<NodePtr<FuncParam>>();
     ret->returnType = ctx->typeRef() ? buildTypeRef(ctx->typeRef()) : nullptr;
