@@ -14,27 +14,27 @@ std::optional<ConstValue> ConstEvaluator::eval(const Expr *expr) {
             return std::make_optional<ConstValue>(ConstValue::makeIntValue(static_cast<const IntExpr*>(expr)->val));
         }
         case NodeType::PathExpr: {
-            const Symbol *sym = analyzer_->resolveConstPath(static_cast<const PathExpr*>(expr));
+            const Symbol *sym = analyzer->resolveConstPath(static_cast<const PathExpr*>(expr));
             if(sym == nullptr) return std::nullopt;
             return evalConst(sym);
         }
         case NodeType::UnaryExpr: {
             const auto *unary = static_cast<const UnaryExpr*>(expr);
             if(unary->op != UnaryOp::Neg) {
-                analyzer_->error(expr->span, "invalid constant expr");
+                analyzer->error(expr->span, "invalid constant expr");
                 return std::nullopt;
             }
             auto value = eval(unary->num.get());
             if(!value || !value->isInt()) return std::nullopt;
             if(value->val.suffix == IntSuffix::U32 || value->val.suffix == IntSuffix::Usize) {
-                analyzer_->error(expr->span, "cannot negate an unsigned constant");
+                analyzer->error(expr->span, "cannot negate an unsigned constant");
                 return std::nullopt;
             }
             value->val.val = static_cast<unsigned long long>(-static_cast<long long>(value->val.val));
             return value;
         }
         default: {
-            analyzer_->error(expr->span, "invalid constant expr");
+            analyzer->error(expr->span, "invalid constant expr");
             break;
         }
     }
@@ -43,33 +43,33 @@ std::optional<ConstValue> ConstEvaluator::eval(const Expr *expr) {
 
 std::optional<ConstValue> ConstEvaluator::evalConst(const Symbol *sym) {
     if(sym->kind != SymbolKind::Const && sym->kind != SymbolKind::AssocConst) {
-        analyzer_->error(sym->span, "not a constant");
+        analyzer->error(sym->span, "not a constant");
         return std::nullopt;
     }
 
-    if(auto it = memo_.find(sym); it != memo_.end()) {
+    if(auto it = memo.find(sym); it != memo.end()) {
         return it->second;
     }
 
-    if(failed_.count(sym)) {
+    if(failed.count(sym)) {
         return std::nullopt;
     }
 
-    if(visiting_.count(sym)) {//circle, invalid
-        analyzer_->error(sym->span, "cyclic constant");
+    if(visiting.count(sym)) {//circle, invalid
+        analyzer->error(sym->span, "cyclic constant");
         return std::nullopt;
     }
 
-    visiting_.insert(sym);
+    visiting.insert(sym);
     const auto *it = static_cast<const ConstItem*>(sym->decl);
     std::optional<ConstValue> ret = eval(it->value.get());
-    visiting_.erase(sym);
+    visiting.erase(sym);
 
     if(ret) {
-        memo_.emplace(sym, *ret);
+        memo.emplace(sym, *ret);
     }
     else {
-        failed_.insert(sym);
+        failed.insert(sym);
     }
     return ret;
 }

@@ -33,15 +33,15 @@ struct ConstValue {
 
 class ConstEvaluator {
 public:
-    void setAnalyzer(SemanticAnalyzer *analyzer) { analyzer_ = analyzer; }
+    void setAnalyzer(SemanticAnalyzer *a) { analyzer = a; }
 
     std::optional<ConstValue> eval(const Expr *expr);
     std::optional<ConstValue> evalConst(const Symbol *sym);
 
 private:
-    SemanticAnalyzer *analyzer_ = nullptr;
+    SemanticAnalyzer *analyzer = nullptr;
 
-    std::unordered_map<const Symbol *, ConstValue> memo_;
-    std::unordered_set<const Symbol *> visiting_;
-    std::unordered_set<const Symbol *> failed_;
+    std::unordered_map<const Symbol *, ConstValue> memo;
+    std::unordered_set<const Symbol *> visiting;
+    std::unordered_set<const Symbol *> failed;
 };

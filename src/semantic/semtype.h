@@ -55,13 +55,26 @@ struct SemType {
         t->structDef = def;
         return t;
     }
-    static SemTypePtr makeError() { return make(SemKind::Error); }
+    static SemTypePtr makeError() {
+        return make(SemKind::Error);
+    }
+    static SemTypePtr makeUnit() {
+        return make(SemKind::Unit);
+    }
+    static SemTypePtr makeNever() {
+        return make(SemKind::Never);
+    }
 
     bool isInteger() const {
         return kind == SemKind::I32 || kind == SemKind::U32 ||
                kind == SemKind::Isize || kind == SemKind::Usize;
     }
-    bool isError() const { return kind == SemKind::Error; }
+    bool isError() const {
+        return kind == SemKind::Error;
+    }
+    bool isNever() const {
+        return kind == SemKind::Never;
+    }
 };
 
 inline bool sameType(const SemTypePtr &a, const SemTypePtr &b) {

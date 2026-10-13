@@ -9,6 +9,7 @@
 #include "AST/AstBuilder.h"
 #include "AST/AstCheck.h"
 #include "AST/AstDumper.h"
+#include "semantic/analyzer.h"
 
 static std::string readAll(std::istream &in) {
     std::ostringstream ss;
@@ -60,6 +61,20 @@ int main(int argc, char **argv) {
     if(!stage.empty()) {
         if(stage == "parse") {
             return 0;
+        }
+        if(stage == "semantic") {
+            auto *crate = dynamic_cast<Crate*>(ast.get());
+            if(crate == nullptr) {
+                std::cerr << "semantic stage requires a crate entry\n";
+                return 1;
+            }
+            SemanticAnalyzer analyzer;
+            bool ok = analyzer.analyze(crate);
+            for(const Diagnostic &d : analyzer.diagnostics()) {
+                std::cerr << d.span.beginLine << ":" << d.span.beginCol
+                          << ": error: " << d.message << "\n";
+            }
+            return ok ? 0 : 1;
         }
         std::cerr << "unsupported stage: " << stage << "\n";
         return 1;

@@ -53,8 +53,8 @@ public:
     const StructInfo *structInfo(const StructDefItem *def) const;
     const FuncSig *funcSig(const Symbol *sym) const;
 
-    const std::unordered_map<std::string, Symbol *> &types() const;
-    const std::unordered_map<std::string, Symbol *> &globals() const;
+    const std::unordered_map<std::string, Symbol *> &typeTable() const;
+    const std::unordered_map<std::string, Symbol *> &globalTable() const;
 
     friend class ConstEvaluator;
 
@@ -86,6 +86,8 @@ private:
 
     void checkEntry();
 
+    void checkBody(Crate *crate);
+
     SemTypePtr checkType(Type *type);
     SemTypePtr checkPathType(PathType *type);
 
@@ -99,17 +101,19 @@ private:
 
     void checkFunc(FuncDefItem *item);
     void checkStmt(Stmt *stmt, Scope &scope);
+    void checkImpl(ImplItem *item);
     SemTypePtr checkExpr(Expr *expr, Scope &scope, const SemTypePtr &expected = nullptr);
 
     std::vector<Diagnostic> diags;
 
-    std::unordered_map<std::string, Symbol *> types_;
-    std::unordered_map<std::string, Symbol *> globals_;
-    std::unordered_map<const StructDefItem *, StructInfo> structs_;
-    std::unordered_map<const Symbol *, ConstValue> constValues_;
-    std::unordered_map<const Symbol *, FuncSig> sigs_;
-    std::vector<std::unique_ptr<Symbol>> ownedSymbols_;
+    std::unordered_map<std::string, Symbol *> types;
+    std::unordered_map<std::string, Symbol *> globals;
+    std::unordered_map<const StructDefItem *, StructInfo> structs;
+    std::unordered_map<const ImplItem *, const StructDefItem *> implTargets;
+    std::unordered_map<const Symbol *, ConstValue> constValues;
+    std::unordered_map<const Symbol *, FuncSig> sigs;
+    std::vector<std::unique_ptr<Symbol>> ownedSymbols;
 
-    ConstEvaluator constEval_;
-    const StructDefItem *currentImplSelf_ = nullptr;
+    ConstEvaluator constEval;
+    const StructDefItem *currentImplSelf = nullptr;
 };
