@@ -96,6 +96,32 @@ inline bool sameType(const SemTypePtr &a, const SemTypePtr &b) {
     }
 }
 
+inline bool canCoerce(const SemTypePtr &src, const SemTypePtr &dst) {
+    if(!src || !dst) return true;
+    if(src->isError() || dst->isError()) return true;
+    if(src->kind == SemKind::Never) return true;
+    if(sameType(src, dst)) return true;
+
+    if(src->kind != SemKind::Ref || dst->kind != SemKind::Ref) return false;
+    if(dst->isMut && !src->isMut) return false;
+
+    SemTypePtr cur = src->inner;
+    while(cur) {
+        if(sameType(cur, dst->inner)) return true;
+        if(cur->kind == SemKind::Ref) {
+            if(dst->isMut && !cur->isMut) return false;
+            cur = cur->inner;
+        }
+        else if(cur->kind == SemKind::Box) {
+            cur = cur->inner;
+        }
+        else {
+            return false;
+        }
+    }
+    return false;
+}
+
 inline std::string typeToString(const SemTypePtr &t) {
     if(!t) return "<null>";
     switch(t->kind) {

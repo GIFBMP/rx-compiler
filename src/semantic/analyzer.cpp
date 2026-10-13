@@ -751,7 +751,7 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
         const Expr *tail = item->body->tail.get();
         SemTypePtr result = checkExpr(item->body->tail.get(), scope, sig ? sig->ret : nullptr);
         if(sig && sig->ret && !sig->ret->isError() && result && !result->isError() &&
-           !result->isNever() && !sameType(result, sig->ret)) {
+           !result->isNever() && !canCoerce(result, sig->ret)) {
             error(tail->span, "function body type does not match return type");
         }
     }
@@ -783,7 +783,7 @@ void SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
             auto assignType = st->type ? checkType(st->type.get()) : nullptr;
             auto initType = checkExpr(st->init.get(), scope, assignType);
             if(assignType && !assignType->isError() && initType && !initType->isError() && 
-               !initType->isNever() && !sameType(assignType, initType)) {
+               !initType->isNever() && !canCoerce(initType, assignType)) {
                 error(st->span, "initializer type does not match the expected type");
             }
             auto sym = std::make_unique<Symbol>();
@@ -803,7 +803,7 @@ void SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
             auto unit = SemType::makeUnit();
             auto tmp = \
                 checkExpr(st->expr.get(), scope, st->hasSemi ? nullptr : unit);
-            if(!st->hasSemi && tmp && !tmp->isError() && !tmp->isNever() && !sameType(tmp, unit)) {
+            if(!st->hasSemi && tmp && !tmp->isError() && !tmp->isNever() && !canCoerce(tmp, unit)) {
                 error(st->span, "block expr without semi must be unit type");
             }
             break;
@@ -841,20 +841,23 @@ SemTypePtr SemanticAnalyzer::checkExpr(Expr *expr, Scope &scope, const SemTypePt
                 }
             }
             auto ret = SemType::make(kind);
-            if(expected && !expected->isError() && !expected->isNever() && !sameType(expected, ret)) {
+            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
                 error(tmp->span, "type mismatch");
             }
             return ret;
         }
         case NodeType::BoolExpr: {
             auto ret = SemType::make(SemKind::Bool);
-            if(expected && !expected->isError() && !expected->isNever() && !sameType(expected, ret)) {
+            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
                 error(expr->span, "type mismatch");
             }
             return ret;
         }
         case NodeType::UnaryExpr: {
-
+            auto *tmp = static_cast<UnaryExpr*>(expr);
+            switch(tmp->op) {
+                
+            }
         }
         case NodeType::BinaryExpr: {
 
