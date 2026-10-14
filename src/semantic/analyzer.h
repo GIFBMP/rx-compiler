@@ -109,6 +109,7 @@ private:
     void checkImpl(ImplItem *item);
     SemTypePtr checkExpr(Expr *expr, Scope &scope, const SemTypePtr &expected = nullptr);
     PlaceInfo placeInfo(Expr *expr, Scope &scope);
+    SemTypePtr placeTypeOf(Expr *expr, Scope &scope);
 
     SemTypePtr checkIntExpr(IntExpr *expr, Scope &scope, const SemTypePtr &expected);
     SemTypePtr checkBoolExpr(BoolExpr *expr, Scope &scope, const SemTypePtr &expected);

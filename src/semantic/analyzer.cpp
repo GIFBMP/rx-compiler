@@ -1,4 +1,5 @@
 #include "analyzer.h"
+#include "AST/AstNode.h"
 #include "AST/type.h"
 #include "semantic/symbol.h"
 #include <set>
@@ -1005,7 +1006,7 @@ SemTypePtr SemanticAnalyzer::checkBinaryExpr(BinaryExpr *expr, Scope &scope, con
         return SemType::makeError();
     }
 
-    SemTypePtr ret, l, r;
+    SemTypePtr ret, l = lhs, r = rhs;
     switch(expr->op) {
         case BinaryOp::Add:
         case BinaryOp::Sub:
@@ -1017,14 +1018,14 @@ SemTypePtr SemanticAnalyzer::checkBinaryExpr(BinaryExpr *expr, Scope &scope, con
                     error(expr->span, "binary op does not support a mutable reference operand");
                     return SemType::makeError();
                 }
-                l = lhs;
+                l = lhs->inner;
             }
             if(rhs->kind == SemKind::Ref) {
                 if(rhs->isMut) {
                     error(expr->span, "binary op does not support a mutable reference operand");
                     return SemType::makeError();
                 }
-                r = rhs;
+                r = rhs->inner;
             }
             if(!l || !r) return SemType::makeError();
             if(!l->isInteger() || !sameType(l, r)) {
@@ -1042,14 +1043,14 @@ SemTypePtr SemanticAnalyzer::checkBinaryExpr(BinaryExpr *expr, Scope &scope, con
                     error(expr->span, "binary op does not support a mutable reference operand");
                     return SemType::makeError();
                 }
-                l = lhs;
+                l = lhs->inner;
             }
             if(rhs->kind == SemKind::Ref) {
                 if(rhs->isMut) {
                     error(expr->span, "binary op does not support a mutable reference operand");
                     return SemType::makeError();
                 }
-                r = rhs;
+                r = rhs->inner;
             }
             if(!l || !r) return SemType::makeError();
             if((!l->isInteger() && !l->isBool()) || !sameType(l, r)) {
@@ -1066,14 +1067,14 @@ SemTypePtr SemanticAnalyzer::checkBinaryExpr(BinaryExpr *expr, Scope &scope, con
                     error(expr->span, "binary op does not support a mutable reference operand");
                     return SemType::makeError();
                 }
-                l = lhs;
+                l = lhs->inner;
             }
             if(rhs->kind == SemKind::Ref) {
                 if(rhs->isMut) {
                     error(expr->span, "binary op does not support a mutable reference operand");
                     return SemType::makeError();
                 }
-                r = rhs;
+                r = rhs->inner;
             }
             if(!l || !r) return SemType::makeError();
             if(!l->isInteger() || !r->isInteger()) {
@@ -1121,8 +1122,102 @@ SemTypePtr SemanticAnalyzer::checkBinaryExpr(BinaryExpr *expr, Scope &scope, con
 }
 
 SemTypePtr SemanticAnalyzer::checkAssignExpr(AssignExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    PlaceInfo info = placeInfo(expr->lhs.get(), scope);
+    if(!info.isPlace) {
+        error(expr->lhs->span, "assignment destination is not a place");
+        return SemType::makeError();
+    }
+    if(!info.isMut) {
+        error(expr->lhs->span, "cannot assign to an immutable place");
+        return SemType::makeError();
+    }
+    auto lhs = checkExpr(expr->lhs.get(), scope, nullptr);
+    SemTypePtr ret, l, r;
+    switch(expr->op) {
+        case AssignOp::Assign: {
+            auto rhs = checkExpr(expr->rhs.get(), scope, lhs);//the destination type is the RHS expected type
+            if(lhs && !lhs->isError() && rhs && !rhs->isError() &&
+               !rhs->isNever() && !canCoerce(rhs, lhs)) {
+                error(expr->rhs->span, "assigned value type does not match the destination type");
+            }
+            ret = SemType::makeUnit();
+            break;
+        }
+        case AssignOp::Add:
+        case AssignOp::Sub:
+        case AssignOp::Mul: 
+        case AssignOp::Div: 
+        case AssignOp::Mod: {
+            l = lhs;
+            r = checkExpr(expr->rhs.get(), scope, nullptr);
+            if(!l || l->isError() || !r || r->isError()) {
+                ret = SemType::makeUnit();
+                break;
+            }
+            if(r->kind == SemKind::Ref) {
+                if(r->isMut) {
+                    error(expr->span, "compound assignment does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                r = r->inner;
+            }
+            if(!l->isInteger() || !sameType(l, r)) {
+                error(expr->span, "arithmetic compound assignment requires the same integer type on both sides");
+                return SemType::makeError();
+            }
+            ret = SemType::makeUnit();
+            break;
+        }
+        case AssignOp::BitAnd:
+        case AssignOp::BitOr:
+        case AssignOp::BitXor: {
+            l = lhs;
+            r = checkExpr(expr->rhs.get(), scope, nullptr);
+            if(!l || l->isError() || !r || r->isError()) {
+                ret = SemType::makeUnit();
+                break;
+            }
+            if(r->kind == SemKind::Ref) {
+                if(r->isMut) {
+                    error(expr->span, "compound assignment does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                r = r->inner;
+            }
+            if((!l->isInteger() && !l->isBool()) || !sameType(l, r)) {
+                error(expr->span, "bitwise compound assignment requires the same integer or bool type on both sides");
+                return SemType::makeError();
+            }
+            ret = SemType::makeUnit();
+            break;
+        }
+        case AssignOp::Shl:
+        case AssignOp::Shr: {
+            l = lhs;
+            r = checkExpr(expr->rhs.get(), scope, nullptr);
+            if(!l || l->isError() || !r || r->isError()) {
+                ret = SemType::makeUnit();
+                break;
+            }
+            if(r->kind == SemKind::Ref) {
+                if(r->isMut) {
+                    error(expr->span, "compound assignment does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                r = r->inner;
+            }
+            if(!l->isInteger() || !r->isInteger()) {
+                error(expr->span, "shift compound assignment requires integer operands");
+                return SemType::makeError();
+            }
+            ret = SemType::makeUnit();
+            break;
+        }
+    }
+    if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+        error(expr->span, "type mismatch");
+    }
+    return ret;
 }
 
 SemTypePtr SemanticAnalyzer::checkCastExpr(CastExpr *expr, Scope &scope, const SemTypePtr &expected) {
@@ -1197,7 +1292,21 @@ SemTypePtr SemanticAnalyzer::checkBreakExpr(BreakExpr *expr, Scope &scope, const
 
 SemTypePtr SemanticAnalyzer::checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    return SemType::makeNever();
+}
+
+static bool placeDerefMut(const SemTypePtr &type, bool baseMut) {
+    if(!type || type->isError()) return true;//unknown: assume mutable (avoid false reject)
+    bool hasRef = false, allMut = true;
+    SemTypePtr t = type;
+    while(t && (t->kind == SemKind::Ref || t->kind == SemKind::Box)) {
+        if(t->kind == SemKind::Ref) {
+            hasRef = true;
+            if(!t->isMut) allMut = false;
+        }
+        t = t->inner;
+    }
+    return hasRef ? allMut : baseMut;
 }
 
 PlaceInfo SemanticAnalyzer::placeInfo(Expr *expr, Scope &scope) {
@@ -1224,32 +1333,60 @@ PlaceInfo SemanticAnalyzer::placeInfo(Expr *expr, Scope &scope) {
         case NodeType::FieldExpr: {
             auto *field = static_cast<FieldExpr*>(expr);
             PlaceInfo base = placeInfo(field->base.get(), scope);
-            if(!base.isPlace) return {};
-            return {true, base.isMut};//a field inherits its base place's mutability
+            if(!base.isPlace) {
+                return {true, true};//a field of an rvalue temporary is a mutable place
+            }
+            return {true, placeDerefMut(placeTypeOf(field->base.get(), scope), base.isMut)};
         }
         case NodeType::IndexExpr: {
             auto *index = static_cast<IndexExpr*>(expr);
             PlaceInfo base = placeInfo(index->base.get(), scope);
-            if(!base.isPlace) return {};
-            return {true, base.isMut};
+            if(!base.isPlace) {
+                return {true, true};
+            }
+            return {true, placeDerefMut(placeTypeOf(index->base.get(), scope), base.isMut)};
         }
         case NodeType::UnaryExpr: {
             auto *unary = static_cast<UnaryExpr*>(expr);
             if(unary->op != UnaryOp::Deref) return {};
-            PlaceInfo base = placeInfo(unary->num.get(), scope);
-            if(!base.isPlace) return {};
-            SemTypePtr t = checkExpr(unary->num.get(), scope, nullptr);
-            if(!t || t->isError()) return {true, true};//unknown operand type: assume mutable (no false reject)
-            bool mut = false;
-            if(t->kind == SemKind::Ref) {
-                mut = t->isMut;//&mut U deref to a mutable place
+            SemTypePtr t = placeTypeOf(unary->num.get(), scope);
+            if(!t || t->isError()) {//unknown operand type: assume mutable
+                return {true, true};
             }
-            else if(t->kind == SemKind::Box) {
-                mut = base.isMut;
+            if(t->kind == SemKind::Ref) {//&mut x/&x deref to a place
+                return {true, t->isMut};
             }
-            return {true, mut};
+            if(t->kind == SemKind::Box) {
+                PlaceInfo base = placeInfo(unary->num.get(), scope);
+                return {true, base.isMut};//a Box inherits its owner place's mutability
+            }
+            return {};//scalars/Vec/ ... are not dereferenceable
         }
         default:
             return {};
+    }
+}
+
+SemTypePtr SemanticAnalyzer::placeTypeOf(Expr *expr, Scope &scope) {
+    if(expr == nullptr) return nullptr;
+    switch(expr->typ) {
+        case NodeType::GroupExpr:
+            return placeTypeOf(static_cast<GroupExpr*>(expr)->inner.get(), scope);
+        case NodeType::PathExpr: {
+            auto *path = static_cast<PathExpr*>(expr);
+            if(path->segments.size() != 1) return nullptr;
+            const PathSegment &seg = path->segments[0];
+            Symbol *sym = nullptr;
+            if(seg.isSelf) {
+                sym = scope.lookup("self");
+            }
+            else if(!seg.isSelfType) {
+                sym = scope.lookup(seg.ident);
+                if(sym == nullptr) sym = lookupValue(seg.ident);
+            }
+            return sym ? sym->type : nullptr;
+        }
+        default:
+            return nullptr;
     }
 }
