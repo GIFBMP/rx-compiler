@@ -16,7 +16,9 @@ std::optional<ConstValue> ConstEvaluator::eval(const Expr *expr) {
         case NodeType::PathExpr: {
             const Symbol *sym = analyzer->resolveConstPath(static_cast<const PathExpr*>(expr));
             if(sym == nullptr) return std::nullopt;
-            return evalConst(sym);
+            auto value = evalConst(sym);
+            if(value && sym->type) value->type = sym->type;//a const path has the declared type of its target
+            return value;
         }
         case NodeType::UnaryExpr: {
             const auto *unary = static_cast<const UnaryExpr*>(expr);
@@ -26,10 +28,12 @@ std::optional<ConstValue> ConstEvaluator::eval(const Expr *expr) {
             }
             auto value = eval(unary->num.get());
             if(!value || !value->isInt()) return std::nullopt;
-            if(value->val.suffix == IntSuffix::U32 || value->val.suffix == IntSuffix::Usize) {
-                analyzer->error(expr->span, "cannot negate an unsigned constant");
+            SemKind kind = value->type ? value->type->kind : SemKind::I32;
+            if(kind != SemKind::I32 && kind != SemKind::Isize) {
+                analyzer->error(expr->span, "cannot negate a non-signed value");
                 return std::nullopt;
             }
+            value->type = SemType::make(kind);
             value->val.val = static_cast<unsigned long long>(-static_cast<long long>(value->val.val));
             return value;
         }

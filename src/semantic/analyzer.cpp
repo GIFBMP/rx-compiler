@@ -364,24 +364,22 @@ void SemanticAnalyzer::evaluateConst(Symbol *sym) {
 }
 
 void SemanticAnalyzer::checkConstValueType(const Symbol *sym, const ConstValue &value) {
-    const SemTypePtr &type = sym->type;
-    if(!type || type->isError()) return;
+    const SemTypePtr &declared = sym->type;
+    if(!declared || declared->isError()) return;
     if(value.kind == ConstKind::Bool) {
-        if(type->kind != SemKind::Bool) {
+        if(declared->kind != SemKind::Bool) {
             error(sym->span, "constant value type does not match declared type");
         }
         return;
     }
-    if(!type->isInteger()) {
+    if(!declared->isInteger()) {
         error(sym->span, "constant value type does not match declared type");
         return;
     }
-    switch(value.val.suffix) {
-        case IntSuffix::Infer: break;
-        case IntSuffix::I32:   if(type->kind != SemKind::I32)   error(sym->span, "constant initializer type does not match declared type"); break;
-        case IntSuffix::U32:   if(type->kind != SemKind::U32)   error(sym->span, "constant initializer type does not match declared type"); break;
-        case IntSuffix::Isize: if(type->kind != SemKind::Isize) error(sym->span, "constant initializer type does not match declared type"); break;
-        case IntSuffix::Usize: if(type->kind != SemKind::Usize) error(sym->span, "constant initializer type does not match declared type"); break;
+    const SemTypePtr &vt = value.type;
+    if(!vt || vt->isError()) return;//unknown/infer: adopts declared type
+    if(!canCoerce(vt, declared)) {
+        error(sym->span, "constant initializer type does not match declared type");
     }
 }
 
@@ -482,7 +480,7 @@ bool SemanticAnalyzer::structHasDerive(const StructDefItem *def, Derive d) const
 }
 
 bool SemanticAnalyzer::typeSupportsDerive(const SemTypePtr &type, Derive d,
-        std::set<std::pair<const StructDefItem *, Derive>> &inprogress) {
+        std::set<std::pair<const StructDefItem *, Derive>> &vis) {
     if(!type || type->isError()) return true;
     switch(type->kind) {
         case SemKind::I32: 
@@ -497,31 +495,31 @@ bool SemanticAnalyzer::typeSupportsDerive(const SemTypePtr &type, Derive d,
             if(d == Derive::Copy || d == Derive::Clone) {
                 return !type->isMut;
             }
-            return typeSupportsDerive(type->inner, d, inprogress);
+            return typeSupportsDerive(type->inner, d, vis);
         }
         case SemKind::Array:
-            return typeSupportsDerive(type->elem, d, inprogress);
+            return typeSupportsDerive(type->elem, d, vis);
         case SemKind::Box:
         case SemKind::Vec: {
             if(d == Derive::Copy) {
                 return false;
             }
-            return typeSupportsDerive(type->inner, d, inprogress);
+            return typeSupportsDerive(type->inner, d, vis);
         }
         case SemKind::Struct: {
             const StructDefItem *def = type->structDef;
             if(!structHasDerive(def, d)) return false;
             auto key = std::make_pair(def, d);
-            if(inprogress.count(key)) return true;
-            inprogress.insert(key);
+            if(vis.count(key)) return true;
+            vis.insert(key);
             bool ok = true;
             const StructInfo *info = structInfo(def);
             if(info) {
                 for(auto &field : info->fields) {
-                    if(!typeSupportsDerive(field.type, d, inprogress)) { ok = false; break; }
+                    if(!typeSupportsDerive(field.type, d, vis)) { ok = false; break; }
                 }
             }
-            inprogress.erase(key);
+            vis.erase(key);
             return ok;
         }
         default:
@@ -548,10 +546,10 @@ void SemanticAnalyzer::checkDerives() {
         if(hasCopy && !hasClone) error(def->span, "Copy requires Clone");
         if(hasEq && !hasPartialEq) error(def->span, "Eq requires PartialEq");
 
-        std::set<std::pair<const StructDefItem *, Derive>> inprogress;
+        std::set<std::pair<const StructDefItem *, Derive>> vis;
         for(Derive d : info.derives) {
             for(auto &field : info.fields) {
-                if(!typeSupportsDerive(field.type, d, inprogress)) {
+                if(!typeSupportsDerive(field.type, d, vis)) {
                     error(def->span, "a field does not support the requested derive");
                     break;
                 }
@@ -744,8 +742,11 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
     }
 
     if(item->body == nullptr) return;
+    bool bodyError = false, bodyNever = false;
     for(auto &stmt: item->body->statements) {
-        checkStmt(stmt.get(), scope);
+        SemTypePtr t = checkStmt(stmt.get(), scope);
+        if(!t || t->isError()) bodyError = true;//insufficient info: suppress the check below
+        else if(t->isNever()) bodyNever = true; //any divergent statement makes the block diverge
     }
     if(item->body->tail) {
         const Expr *tail = item->body->tail.get();
@@ -755,8 +756,11 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
             error(tail->span, "function body type does not match return type");
         }
     }
-    else {//by return expr
-        //TODO
+    else if(!bodyError && !bodyNever && sig && sig->ret && !sig->ret->isError()) {
+        //no tail, by return
+        if(!canCoerce(SemType::makeUnit(), sig->ret)) {
+            error(item->body->span, "function body type does not match return type");
+        }
     }
 }
 
@@ -776,7 +780,7 @@ void SemanticAnalyzer::checkImpl(ImplItem *item) {
     currentImplSelf = saved;
 }
 
-void SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
+SemTypePtr SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
     switch(stmt->typ) {
         case NodeType::LetStmt: {
             auto *st = static_cast<LetStmt*>(stmt);
@@ -796,7 +800,7 @@ void SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
             sym->type = assignType ? assignType
                                    : (initType ? initType : SemType::makeError());
             scope.define(std::move(sym));
-            break;
+            return SemType::makeUnit();
         }
         case NodeType::ExprStmt: {
             auto *st = static_cast<ExprStmt*>(stmt);
@@ -806,84 +810,446 @@ void SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
             if(!st->hasSemi && tmp && !tmp->isError() && !tmp->isNever() && !canCoerce(tmp, unit)) {
                 error(st->span, "block expr without semi must be unit type");
             }
-            break;
+            return tmp;
         }
         case NodeType::NullStmt:
-        default: break;
+        default:
+            return SemType::makeUnit();
     }
 }
 
 SemTypePtr SemanticAnalyzer::checkExpr(Expr *expr, Scope &scope, const SemTypePtr &expected) {
     switch(expr->typ) {
-        case NodeType::IntExpr: {
-            auto *tmp = static_cast<IntExpr*>(expr);
-            SemKind kind;
-            switch(tmp->val.suffix) {
-                case IntSuffix::I32: {
-                    kind = SemKind::I32;
-                    break;
-                }
-                case IntSuffix::U32: {
-                    kind = SemKind::U32;
-                    break;
-                }
-                case IntSuffix::Isize: {
-                    kind = SemKind::Isize;
-                    break;
-                }
-                case IntSuffix::Usize: {
-                    kind = SemKind::Usize;
-                    break;
-                }
-                case IntSuffix::Infer: {
-                    kind = (expected && expected->isInteger()) ? expected->kind : SemKind::I32;
-                    break;
-                }
-            }
-            auto ret = SemType::make(kind);
-            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
-                error(tmp->span, "type mismatch");
-            }
-            return ret;
+        case NodeType::IntExpr:        return checkIntExpr(static_cast<IntExpr*>(expr), scope, expected);
+        case NodeType::BoolExpr:       return checkBoolExpr(static_cast<BoolExpr*>(expr), scope, expected);
+        case NodeType::UnitExpr:       return checkUnitExpr(static_cast<UnitExpr*>(expr), scope, expected);
+        case NodeType::GroupExpr:      return checkGroupExpr(static_cast<GroupExpr*>(expr), scope, expected);
+        case NodeType::UnaryExpr:      return checkUnaryExpr(static_cast<UnaryExpr*>(expr), scope, expected);
+        case NodeType::BinaryExpr:     return checkBinaryExpr(static_cast<BinaryExpr*>(expr), scope, expected);
+        case NodeType::AssignExpr:     return checkAssignExpr(static_cast<AssignExpr*>(expr), scope, expected);
+        case NodeType::CastExpr:       return checkCastExpr(static_cast<CastExpr*>(expr), scope, expected);
+        case NodeType::PathExpr:       return checkPathExpr(static_cast<PathExpr*>(expr), scope, expected);
+        case NodeType::FieldExpr:      return checkFieldExpr(static_cast<FieldExpr*>(expr), scope, expected);
+        case NodeType::IndexExpr:      return checkIndexExpr(static_cast<IndexExpr*>(expr), scope, expected);
+        case NodeType::CallExpr:       return checkCallExpr(static_cast<CallExpr*>(expr), scope, expected);
+        case NodeType::MethodCallExpr: return checkMethodCallExpr(static_cast<MethodCallExpr*>(expr), scope, expected);
+        case NodeType::StructExpr:     return checkStructExpr(static_cast<StructExpr*>(expr), scope, expected);
+        case NodeType::ArrayExpr:      return checkArrayExpr(static_cast<ArrayExpr*>(expr), scope, expected);
+        case NodeType::IfExpr:         return checkIfExpr(static_cast<IfExpr*>(expr), scope, expected);
+        case NodeType::WhileExpr:      return checkWhileExpr(static_cast<WhileExpr*>(expr), scope, expected);
+        case NodeType::LoopExpr:       return checkLoopExpr(static_cast<LoopExpr*>(expr), scope, expected);
+        case NodeType::BlockExpr:      return checkBlockExpr(static_cast<BlockExpr*>(expr), scope, expected);
+        case NodeType::ReturnExpr:     return checkReturnExpr(static_cast<ReturnExpr*>(expr), scope, expected);
+        case NodeType::BreakExpr:      return checkBreakExpr(static_cast<BreakExpr*>(expr), scope, expected);
+        case NodeType::ContinueExpr:   return checkContinueExpr(static_cast<ContinueExpr*>(expr), scope, expected);
+        default: break;
+    }
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkIntExpr(IntExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)scope;
+    SemKind kind;
+    switch(expr->val.suffix) {
+        case IntSuffix::I32: {
+            kind = SemKind::I32;
+            break;
         }
-        case NodeType::BoolExpr: {
-            auto ret = SemType::make(SemKind::Bool);
+        case IntSuffix::U32: {
+            kind = SemKind::U32;
+            break;
+        }
+        case IntSuffix::Isize: {
+            kind = SemKind::Isize;
+            break;
+        }
+        case IntSuffix::Usize: {
+            kind = SemKind::Usize;
+            break;
+        }
+        case IntSuffix::Infer: {
+            kind = (expected && expected->isInteger()) ? expected->kind : SemKind::I32;
+            break;
+        }
+    }
+    auto ret = SemType::make(kind);
+    if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+        error(expr->span, "type mismatch");
+    }
+    return ret;
+}
+
+SemTypePtr SemanticAnalyzer::checkBoolExpr(BoolExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)scope;
+    auto ret = SemType::make(SemKind::Bool);
+    if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+        error(expr->span, "type mismatch");
+    }
+    return ret;
+}
+
+SemTypePtr SemanticAnalyzer::checkUnitExpr(UnitExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeUnit();
+}
+
+SemTypePtr SemanticAnalyzer::checkGroupExpr(GroupExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    return checkExpr(expr->inner.get(), scope, expected);
+}
+
+SemTypePtr SemanticAnalyzer::checkUnaryExpr(UnaryExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    switch(expr->op) {
+        case UnaryOp::Neg: {
+            //expected does not propagate through unary operators
+            auto op = checkExpr(expr->num.get(), scope, nullptr);
+            if(!op || op->isError()) return SemType::makeError();
+            auto operand = op;
+            if(op->kind == SemKind::Ref) {
+                if(op->isMut) {//-&mut T is not supported
+                    error(expr->span, "unary minus does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                operand = op->inner;
+            }
+            if(!operand || operand->isError()) return SemType::makeError();
+            if(!operand->isSignedInteger()) {
+                error(expr->span, "unary minus is signed-only");
+                return SemType::makeError();
+            }
+            auto ret = SemType::make(operand->kind);
             if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
                 error(expr->span, "type mismatch");
             }
             return ret;
         }
-        case NodeType::UnaryExpr: {
-            auto *tmp = static_cast<UnaryExpr*>(expr);
-            switch(tmp->op) {
-                
+        case UnaryOp::Not: {
+            auto op = checkExpr(expr->num.get(), scope, nullptr);
+            if(!op || op->isError()) return SemType::makeError();
+            auto operand = op;
+            if(op->kind == SemKind::Ref) {
+                if(op->isMut) {//-&mut T is not supported
+                    error(expr->span, "unary neg does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                operand = op->inner;
             }
+            if(!operand || operand->isError()) return SemType::makeError();
+            if(!operand->isBool() && !operand->isInteger()) {
+                error(expr->span, "unary neg is only supported by bool and int");
+                return SemType::makeError();
+            }
+            auto ret = SemType::make(operand->kind);
+            //!bool: logic not
+            //!int: bitwise not (like ~ in C++)
+            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+                error(expr->span, "type mismatch");
+            }
+            return ret;
         }
-        case NodeType::BinaryExpr: {
-
+        case UnaryOp::Ref: {
+            auto op = checkExpr(expr->num.get(), scope, nullptr);
+            if(!op || op->isError()) return SemType::makeError();
+            auto ret = SemType::makeRef(op, false);
+            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+                error(expr->span, "type mismatch");
+            }
+            return ret;
         }
-        case NodeType::PathExpr: {
-
+        case UnaryOp::Deref: {
+            auto op = checkExpr(expr->num.get(), scope, nullptr);
+            if(!op || op->isError()) return SemType::makeError();
+            if(op->kind != SemKind::Ref && op->kind != SemKind::Box) {
+                error(expr->span, "deref error: ref does not exist");
+                return SemType::makeError();
+            }
+            auto ret = op->inner;
+            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+                error(expr->span, "type mismatch");
+            }
+            return ret;
         }
-        case NodeType::AssignExpr: {
-
+        case UnaryOp::RefMut: {
+            PlaceInfo place = placeInfo(expr->num.get(), scope);
+            if(place.isPlace && !place.isMut) {//let x = 1; &mut x; should be rejected 
+                error(expr->span, "cannot mutably borrow an immutable place");
+                return SemType::makeError();
+            }
+            auto op = checkExpr(expr->num.get(), scope, nullptr);
+            if(!op || op->isError()) return SemType::makeError();
+            auto ret = SemType::makeRef(op, true);
+            if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+                error(expr->span, "type mismatch");
+            }
+            return ret;
         }
-        case NodeType::ArrayExpr: {
-
-        }
-        case NodeType::BlockExpr: {
-
-        }
-        case NodeType::BreakExpr: {
-
-        }
-        case NodeType::CallExpr: {
-
-        }
-        case NodeType::CastExpr: {
-
-        }
-        default: break;
     }
     return SemType::makeError();
+}
+
+static bool orderCompatible(const SemTypePtr &a, const SemTypePtr &b, bool outermost) {
+    if(a->kind != SemKind::Ref && b->kind != SemKind::Ref) {
+        return (a->isInteger() || a->isBool()) && sameType(a, b);
+    }
+    if(a->kind == SemKind::Ref && b->kind == SemKind::Ref) {
+        bool mutOk = (a->isMut == b->isMut) || (outermost && !a->isMut && b->isMut);
+        return mutOk && orderCompatible(a->inner, b->inner, false);
+    }
+    return false;
+}
+
+
+SemTypePtr SemanticAnalyzer::checkBinaryExpr(BinaryExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    auto lhs = checkExpr(expr->lhs.get(), scope, nullptr);
+    auto rhs = checkExpr(expr->rhs.get(), scope, nullptr);
+    if(!lhs || !rhs || lhs->isError() || rhs->isError()) {
+        return SemType::makeError();
+    }
+
+    SemTypePtr ret, l, r;
+    switch(expr->op) {
+        case BinaryOp::Add:
+        case BinaryOp::Sub:
+        case BinaryOp::Mul:
+        case BinaryOp::Div:
+        case BinaryOp::Mod: {
+            if(lhs->kind == SemKind::Ref) {
+                if(lhs->isMut) {
+                    error(expr->span, "binary op does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                l = lhs;
+            }
+            if(rhs->kind == SemKind::Ref) {
+                if(rhs->isMut) {
+                    error(expr->span, "binary op does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                r = rhs;
+            }
+            if(!l || !r) return SemType::makeError();
+            if(!l->isInteger() || !sameType(l, r)) {
+                error(expr->span, "arithmetic requires the same integer type on both sides");
+                return SemType::makeError();
+            }
+            ret = SemType::make(l->kind);
+            break;
+        }
+        case BinaryOp::BitAnd:
+        case BinaryOp::BitOr:
+        case BinaryOp::BitXor: {
+            if(lhs->kind == SemKind::Ref) {
+                if(lhs->isMut) {
+                    error(expr->span, "binary op does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                l = lhs;
+            }
+            if(rhs->kind == SemKind::Ref) {
+                if(rhs->isMut) {
+                    error(expr->span, "binary op does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                r = rhs;
+            }
+            if(!l || !r) return SemType::makeError();
+            if((!l->isInteger() && !l->isBool()) || !sameType(l, r)) {
+                error(expr->span, "bitwise op requires the same integer or bool type on both sides");
+                return SemType::makeError();
+            }
+            ret = SemType::make(l->kind);
+            break;
+        }
+        case BinaryOp::Shl:
+        case BinaryOp::Shr: {
+            if(lhs->kind == SemKind::Ref) {
+                if(lhs->isMut) {
+                    error(expr->span, "binary op does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                l = lhs;
+            }
+            if(rhs->kind == SemKind::Ref) {
+                if(rhs->isMut) {
+                    error(expr->span, "binary op does not support a mutable reference operand");
+                    return SemType::makeError();
+                }
+                r = rhs;
+            }
+            if(!l || !r) return SemType::makeError();
+            if(!l->isInteger() || !r->isInteger()) {
+                error(expr->span, "shift requires integer operands");
+                return SemType::makeError();
+            }
+            ret = SemType::make(l->kind);//result has the left operand's type
+            break;
+        }
+        case BinaryOp::Eq:
+        case BinaryOp::Ne: {
+            std::set<std::pair<const StructDefItem *, Derive>> vis;
+            if(!sameType(lhs, rhs) || !typeSupportsDerive(lhs, Derive::PartialEq, vis)) {
+                error(expr->span, "equality requires the same PartialEq type on both sides");
+                return SemType::makeError();
+            }
+            ret = SemType::make(SemKind::Bool);
+            break;
+        }
+        case BinaryOp::Lt:
+        case BinaryOp::Le:
+        case BinaryOp::Gt:
+        case BinaryOp::Ge: {
+            if(!orderCompatible(lhs, rhs, true)) {
+                error(expr->span, "ordering requires matching scalar operands");
+                return SemType::makeError();
+            }
+            ret = SemType::make(SemKind::Bool);
+            break;
+        }
+        case BinaryOp::LogicalAnd:
+        case BinaryOp::LogicalOr: {
+            if(lhs->kind != SemKind::Bool || rhs->kind != SemKind::Bool) {
+                error(expr->span, "lazy boolean operators require bool operands");
+                return SemType::makeError();
+            }
+            ret = SemType::make(SemKind::Bool);
+            break;
+        }
+    }
+    if(expected && !expected->isError() && !expected->isNever() && !canCoerce(ret, expected)) {
+        error(expr->span, "type mismatch");
+    }
+    return ret;
+}
+
+SemTypePtr SemanticAnalyzer::checkAssignExpr(AssignExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkCastExpr(CastExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkPathExpr(PathExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkFieldExpr(FieldExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkIndexExpr(IndexExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkCallExpr(CallExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkMethodCallExpr(MethodCallExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkStructExpr(StructExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkArrayExpr(ArrayExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkIfExpr(IfExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkWhileExpr(WhileExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkLoopExpr(LoopExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkBlockExpr(BlockExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkReturnExpr(ReturnExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkBreakExpr(BreakExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+SemTypePtr SemanticAnalyzer::checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected) {
+    (void)expr; (void)scope; (void)expected;
+    return SemType::makeError();
+}
+
+PlaceInfo SemanticAnalyzer::placeInfo(Expr *expr, Scope &scope) {
+    if(expr == nullptr) return {};
+    switch(expr->typ) {
+        case NodeType::GroupExpr: {
+            return placeInfo(static_cast<GroupExpr*>(expr)->inner.get(), scope);
+        }
+        case NodeType::PathExpr: {
+            auto *path = static_cast<PathExpr*>(expr);
+            if(path->segments.size() != 1) return {};
+            const PathSegment &seg = path->segments[0];
+            Symbol *sym = nullptr;
+            if(seg.isSelf) {
+                sym = scope.lookup("self");
+            }
+            else if(!seg.isSelfType) {
+                sym = scope.lookup(seg.ident);
+                if(sym == nullptr) sym = lookupValue(seg.ident);
+            }
+            if(sym == nullptr || !sym->isPlace) return {};
+            return {true, sym->isMut};
+        }
+        case NodeType::FieldExpr: {
+            auto *field = static_cast<FieldExpr*>(expr);
+            PlaceInfo base = placeInfo(field->base.get(), scope);
+            if(!base.isPlace) return {};
+            return {true, base.isMut};//a field inherits its base place's mutability
+        }
+        case NodeType::IndexExpr: {
+            auto *index = static_cast<IndexExpr*>(expr);
+            PlaceInfo base = placeInfo(index->base.get(), scope);
+            if(!base.isPlace) return {};
+            return {true, base.isMut};
+        }
+        case NodeType::UnaryExpr: {
+            auto *unary = static_cast<UnaryExpr*>(expr);
+            if(unary->op != UnaryOp::Deref) return {};
+            PlaceInfo base = placeInfo(unary->num.get(), scope);
+            if(!base.isPlace) return {};
+            SemTypePtr t = checkExpr(unary->num.get(), scope, nullptr);
+            if(!t || t->isError()) return {true, true};//unknown operand type: assume mutable (no false reject)
+            bool mut = false;
+            if(t->kind == SemKind::Ref) {
+                mut = t->isMut;//&mut U deref to a mutable place
+            }
+            else if(t->kind == SemKind::Box) {
+                mut = base.isMut;
+            }
+            return {true, mut};
+        }
+        default:
+            return {};
+    }
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "../AST/AstBuilder.h"
+#include "semtype.h"
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,12 +20,28 @@ struct ConstValue {
 
     bool boolVal = false;
 
+    SemTypePtr type;//type of the initializer expr; null = unknown/infer (adopts declared/expected)
+
     static ConstValue makeIntValue(const IntValue &v) {
-        return ConstValue{ConstKind::Int, v, false};
+        ConstValue c;
+        c.kind = ConstKind::Int;
+        c.val = v;
+        switch(v.suffix) {
+            case IntSuffix::I32:   c.type = SemType::make(SemKind::I32);   break;
+            case IntSuffix::U32:   c.type = SemType::make(SemKind::U32);   break;
+            case IntSuffix::Isize: c.type = SemType::make(SemKind::Isize); break;
+            case IntSuffix::Usize: c.type = SemType::make(SemKind::Usize); break;
+            case IntSuffix::Infer: c.type = nullptr;                       break;
+        }
+        return c;
     }
 
     static ConstValue makeBoolValue(bool b) {
-        return ConstValue{ConstKind::Bool, IntValue{}, b};
+        ConstValue c;
+        c.kind = ConstKind::Bool;
+        c.boolVal = b;
+        c.type = SemType::make(SemKind::Bool);
+        return c;
     }
 
     bool isInt() const { return kind == ConstKind::Int; }

@@ -20,6 +20,11 @@ struct Diagnostic {
     std::string message;
 };
 
+struct PlaceInfo {
+    bool isPlace = false;
+    bool isMut = false;//meaningful only when isPlace
+};
+
 struct FuncSig {
     std::vector<SemTypePtr> params;
     SemTypePtr ret;
@@ -82,7 +87,7 @@ private:
     void checkDerives();
     bool structHasDerive(const StructDefItem *def, Derive d) const;
     bool typeSupportsDerive(const SemTypePtr &type, Derive d,
-                            std::set<std::pair<const StructDefItem *, Derive>> &inprogress);
+                            std::set<std::pair<const StructDefItem *, Derive>> &vis);
 
     void checkEntry();
 
@@ -100,9 +105,33 @@ private:
     void error(SourceSpan span, std::string message);
 
     void checkFunc(FuncDefItem *item);
-    void checkStmt(Stmt *stmt, Scope &scope);
+    SemTypePtr checkStmt(Stmt *stmt, Scope &scope);
     void checkImpl(ImplItem *item);
     SemTypePtr checkExpr(Expr *expr, Scope &scope, const SemTypePtr &expected = nullptr);
+    PlaceInfo placeInfo(Expr *expr, Scope &scope);
+
+    SemTypePtr checkIntExpr(IntExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkBoolExpr(BoolExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkUnitExpr(UnitExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkGroupExpr(GroupExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkUnaryExpr(UnaryExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkBinaryExpr(BinaryExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkAssignExpr(AssignExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkCastExpr(CastExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkPathExpr(PathExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkFieldExpr(FieldExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkIndexExpr(IndexExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkCallExpr(CallExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkMethodCallExpr(MethodCallExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkStructExpr(StructExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkArrayExpr(ArrayExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkIfExpr(IfExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkWhileExpr(WhileExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkLoopExpr(LoopExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkBlockExpr(BlockExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkReturnExpr(ReturnExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkBreakExpr(BreakExpr *expr, Scope &scope, const SemTypePtr &expected);
+    SemTypePtr checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected);
 
     std::vector<Diagnostic> diags;
 

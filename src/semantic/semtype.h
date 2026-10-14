@@ -69,6 +69,12 @@ struct SemType {
         return kind == SemKind::I32 || kind == SemKind::U32 ||
                kind == SemKind::Isize || kind == SemKind::Usize;
     }
+    bool isSignedInteger() const {
+        return kind == SemKind::I32 || kind == SemKind::Isize;
+    }
+    bool isBool() const {
+        return kind == SemKind::Bool;
+    }
     bool isError() const {
         return kind == SemKind::Error;
     }
