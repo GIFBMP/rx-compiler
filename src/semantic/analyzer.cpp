@@ -743,11 +743,13 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
     }
 
     if(item->body == nullptr) return;
+    SemTypePtr savedRet = currentFuncRet;
+    currentFuncRet = sig ? sig->ret : nullptr;
     bool bodyError = false, bodyNever = false;
     for(auto &stmt: item->body->statements) {
         SemTypePtr t = checkStmt(stmt.get(), scope);
-        if(!t || t->isError()) bodyError = true;//insufficient info: suppress the check below
-        else if(t->isNever()) bodyNever = true; //any divergent statement makes the block diverge
+        if(!t || t->isError()) bodyError = true;
+        else if(t->isNever()) bodyNever = true;
     }
     if(item->body->tail) {
         const Expr *tail = item->body->tail.get();
@@ -763,6 +765,7 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
             error(item->body->span, "function body type does not match return type");
         }
     }
+    currentFuncRet = savedRet;
 }
 
 void SemanticAnalyzer::checkImpl(ImplItem *item) {
@@ -1339,10 +1342,7 @@ SemTypePtr SemanticAnalyzer::checkPathExpr(PathExpr *expr, Scope &scope, const S
 SemTypePtr SemanticAnalyzer::checkFieldExpr(FieldExpr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)expected;
     auto base = checkExpr(expr->base.get(), scope, nullptr);
-    if(!base || base->isError()) {
-        return SemType::makeError();
-    }
-    while(base->kind == SemKind::Ref || base->kind == SemKind::Box) {
+    while(base && (base->kind == SemKind::Ref || base->kind == SemKind::Box)) {
         base = base->inner;
     }
     if(!base || base->isError()) {
@@ -1367,8 +1367,32 @@ SemTypePtr SemanticAnalyzer::checkFieldExpr(FieldExpr *expr, Scope &scope, const
 }
 
 SemTypePtr SemanticAnalyzer::checkIndexExpr(IndexExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    auto arr = checkExpr(expr->base.get(), scope, nullptr);
+    while(arr && (arr->kind == SemKind::Ref || arr->kind == SemKind::Box)) {
+        arr = arr->inner;
+    }
+    if(!arr || arr->isError()) {
+        return SemType::makeError();
+    }
+    if(arr->kind != SemKind::Array && arr->kind != SemKind::Vec) {
+        error(expr->span, "indexExpr: not an array or a vec");
+        return SemType::makeError();
+    }
+    auto ind = checkExpr(expr->index.get(), scope, SemType::make(SemKind::Usize));
+    if(!ind || ind->isError()) {
+        return SemType::makeError();
+    }
+    if(ind->kind != SemKind::Usize) {
+        error(expr->span, "index type should be Usize");
+        return SemType::makeError();
+    }
+    if(arr->kind == SemKind::Array) {
+        return arr->elem;
+    }
+    else {
+        return arr->inner;
+    }
 }
 
 SemTypePtr SemanticAnalyzer::checkCallExpr(CallExpr *expr, Scope &scope, const SemTypePtr &expected) {
@@ -1387,42 +1411,193 @@ SemTypePtr SemanticAnalyzer::checkStructExpr(StructExpr *expr, Scope &scope, con
 }
 
 SemTypePtr SemanticAnalyzer::checkArrayExpr(ArrayExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    SemTypePtr elemExpected = (expected && expected->kind == SemKind::Array) ? expected->elem : nullptr;
+    if(expr->isRepeat) {
+        auto len = constEval.eval(expr->repeatLen.get());
+        if(!len || len->kind != ConstKind::Int) {
+            error(expr->repeatLen->span, "repeat length is not an integer const");
+            return SemType::makeError();
+        }
+        if(!constExprIsUsize(expr->repeatLen.get())) {
+            error(expr->repeatLen->span, "repeat length must have usize type");
+            return SemType::makeError();
+        }
+        auto elem = checkExpr(expr->repeatValue.get(), scope, elemExpected);
+        if(!elem || elem->isError()) {
+            return SemType::makeError();
+        }
+        if(len->val.val > 1) {//len>1: Copy is required
+            std::set<std::pair<const StructDefItem *, Derive>> vis;
+            if(!typeSupportsDerive(elem, Derive::Copy, vis)) {
+                error(expr->span, "repeating more than once requires a Copy element type");
+            }
+        }
+        return SemType::makeArray(elem, static_cast<std::size_t>(len->val.val));
+    }
+
+    std::vector<SemTypePtr> elemTypes;
+    for(auto &e : expr->elems) {
+        auto t = checkExpr(e.get(), scope, elemExpected);
+        if(!t || t->isError()) {
+            return SemType::makeError();
+        }
+        if(elemExpected && !elemExpected->isError() && !t->isNever() &&
+           !canCoerce(t, elemExpected)) {
+            error(e->span, "array element type does not match the expected element type");
+        }
+        elemTypes.push_back(t);
+    }
+    SemTypePtr elem = elemExpected ? elemExpected : commonType(elemTypes);
+    if(!elem || elem->isError()) {
+        return SemType::makeError();
+    }
+    return SemType::makeArray(elem, expr->elems.size());
 }
 
 SemTypePtr SemanticAnalyzer::checkIfExpr(IfExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    SemTypePtr cond = checkExpr(expr->cond.get(), scope, SemType::make(SemKind::Bool));
+    if(cond && !cond->isError() && !cond->isNever() && cond->kind != SemKind::Bool) {
+        error(expr->cond->span, "if condition must be bool");
+    }
+    if(!expr->elseBranch) {
+        auto bodyType = checkBlockExpr(expr->thenBlock.get(), scope, SemType::makeUnit());
+        if(!bodyType || bodyType->isError()) {
+            return SemType::makeError();
+        }
+        return SemType::makeUnit();
+    }
+    auto bodyType = checkBlockExpr(expr->thenBlock.get(), scope, expected);
+    if(!bodyType || bodyType->isError()) {
+        return SemType::makeError();
+    }
+    auto elseType = checkExpr(expr->elseBranch.get(), scope, expected);
+    if(!elseType || elseType->isError()) {
+        return SemType::makeError();
+    }
+    if(expected) {
+        if(!expected->isError()) {
+            if(!bodyType->isNever() && !canCoerce(bodyType, expected)) {
+                error(expr->thenBlock->span, "if branch type does not match the expected type");
+            }
+            if(!elseType->isNever() && !canCoerce(elseType, expected)) {
+                error(expr->elseBranch->span, "else branch type does not match the expected type");
+            }
+        }
+        return expected;
+    }
+    return commonType({bodyType, elseType});
 }
 
 SemTypePtr SemanticAnalyzer::checkWhileExpr(WhileExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    SemTypePtr cond = checkExpr(expr->cond.get(), scope, SemType::make(SemKind::Bool));
+    if(cond && !cond->isError() && !cond->isNever() && cond->kind != SemKind::Bool) {
+        error(expr->cond->span, "while condition must be bool");
+    }
+    loopStack.push_back(LoopCtx{nullptr, {}, true});
+    auto bodyType = checkBlockExpr(expr->body.get(), scope, SemType::makeUnit());
+    if(!bodyType || bodyType->isError()) {
+        return SemType::makeError();
+    }
+    loopStack.pop_back();
+    return SemType::makeUnit();
 }
 
 SemTypePtr SemanticAnalyzer::checkLoopExpr(LoopExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    loopStack.push_back(LoopCtx{expected, {}, false});
+    auto bodyType = checkBlockExpr(expr->body.get(), scope, SemType::makeUnit());
+    LoopCtx ctx = std::move(loopStack.back());
+    loopStack.pop_back();
+    if(!bodyType || bodyType->isError()) {
+        return SemType::makeError();
+    }
+    if(ctx.breaks.empty()) {
+        return SemType::makeNever();
+    }
+    if(expected) {
+        return expected;
+    }
+    return commonType(ctx.breaks);
 }
 
 SemTypePtr SemanticAnalyzer::checkBlockExpr(BlockExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    Scope child(&scope);
+    bool bodyError = false, bodyNever = false;
+    for(auto &stmt: expr->statements) {
+        SemTypePtr t = checkStmt(stmt.get(), child);
+        if(!t || t->isError()) bodyError = true;
+        else if(t->isNever()) bodyNever = true;
+    }
+    if(bodyError) {
+        return SemType::makeError();
+    }
+    if(expr->tail) {
+        SemTypePtr ret = checkExpr(expr->tail.get(), child, expected);
+        if(!ret || ret->isError()) {
+            return SemType::makeError();
+        }
+        if(bodyNever) {
+            return SemType::makeNever();
+        }
+        return ret;
+    }
+    return bodyNever ? SemType::makeNever() : SemType::makeUnit();
 }
 
 SemTypePtr SemanticAnalyzer::checkReturnExpr(ReturnExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    const SemTypePtr &ret = currentFuncRet;
+    if(expr->val == nullptr) {
+        SemTypePtr unit = SemType::makeUnit();
+        if(ret && !ret->isError() && !ret->isNever() && !canCoerce(unit, ret)) {
+            error(expr->span, "return without a value in a non-unit function");
+        }
+    }
+    else {
+        SemTypePtr val = checkExpr(expr->val.get(), scope, ret);
+        if(ret && !ret->isError() && val && !val->isError() &&
+           !val->isNever() && !canCoerce(val, ret)) {
+            error(expr->val->span, "return value type does not match the function return type");
+        }
+    }
+    return SemType::makeNever();
 }
 
 SemTypePtr SemanticAnalyzer::checkBreakExpr(BreakExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    if(loopStack.empty()) {
+        error(expr->span, "break outside a loop");
+        return SemType::makeError();
+    }
+    bool isWhile = loopStack.back().isWhile;
+    SemTypePtr loopExpected = loopStack.back().expected;
+    if(expr->val == nullptr) {
+        loopStack.back().breaks.push_back(SemType::makeUnit());
+        return SemType::makeNever();
+    }
+    if(isWhile) {
+        error(expr->span, "a while cannot accept a break value");
+        return SemType::makeError();
+    }
+    auto val = checkExpr(expr->val.get(), scope, loopExpected);
+    if(!val || val->isError()) {
+        return SemType::makeError();
+    }
+    if(loopExpected && !loopExpected->isError() && !val->isNever() &&
+       !canCoerce(val, loopExpected)) {
+        error(expr->val->span, "break value type does not match the loop expected type");
+    }
+    loopStack.back().breaks.push_back(val);
+    return SemType::makeNever();
 }
 
 SemTypePtr SemanticAnalyzer::checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
+    (void)scope;
+    (void)expected;
+    if(loopStack.empty()) {
+        error(expr->span, "continue outside a loop");
+        return SemType::makeError();
+    }
     return SemType::makeNever();
 }
 

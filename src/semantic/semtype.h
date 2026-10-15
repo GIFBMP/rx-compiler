@@ -3,6 +3,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 struct StructDefItem;
 
@@ -126,6 +127,36 @@ inline bool canCoerce(const SemTypePtr &src, const SemTypePtr &dst) {
         }
     }
     return false;
+}
+
+inline SemTypePtr commonType(const std::vector<SemTypePtr> &results) {
+    std::vector<SemTypePtr> rs;
+    for(const SemTypePtr &t : results) {
+        if(!t || t->isError()) return SemType::makeError();
+        if(t->isNever()) continue;
+        rs.push_back(t);
+    }
+    if(rs.empty()) return SemType::makeNever();
+
+    SemTypePtr target = rs[0];
+    for(size_t i = 1; i < rs.size(); i++) {
+        const SemTypePtr &tmp = rs[i];
+        if(canCoerce(tmp, target)) continue;
+        bool flag = canCoerce(target, tmp);
+        for(size_t j = 0; j < i; j++) {
+            if(!canCoerce(rs[j], tmp)) {
+                flag = false;
+                break;
+            }
+        }
+        if(flag) {
+            target = tmp;
+        }
+        else {
+            return SemType::makeError();
+        }
+    }
+    return target;
 }
 
 inline std::string typeToString(const SemTypePtr &t) {

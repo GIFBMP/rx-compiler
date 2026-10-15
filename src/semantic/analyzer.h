@@ -47,6 +47,12 @@ struct StructInfo {
     std::vector<Derive> derives;
 };
 
+struct LoopCtx {
+    SemTypePtr expected;
+    std::vector<SemTypePtr> breaks;
+    bool isWhile = false;
+};
+
 class SemanticAnalyzer {
 public:
     bool analyze(Crate *crate);
@@ -135,6 +141,7 @@ private:
     SemTypePtr checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected);
 
     std::vector<Diagnostic> diags;
+    std::vector<LoopCtx> loopStack;
 
     std::unordered_map<std::string, Symbol *> types;
     std::unordered_map<std::string, Symbol *> globals;
@@ -146,4 +153,5 @@ private:
 
     ConstEvaluator constEval;
     const StructDefItem *currentImplSelf = nullptr;
+    SemTypePtr currentFuncRet;
 };
