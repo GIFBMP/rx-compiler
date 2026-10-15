@@ -1221,17 +1221,148 @@ SemTypePtr SemanticAnalyzer::checkAssignExpr(AssignExpr *expr, Scope &scope, con
 }
 
 SemTypePtr SemanticAnalyzer::checkCastExpr(CastExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    auto op = checkExpr(expr->expr.get(), scope, nullptr);
+    if(!op || op->isError()) {
+        return SemType::makeError();
+    }
+    if(!op->isInteger() && !op->isBool()) {
+        error(expr->span, "cast op only supports bool and integer");
+        return SemType::makeError();
+    }
+    auto typ = checkType(expr->type.get());
+    if(!typ || typ->isError()) {
+        return SemType::makeError();
+    }
+    if(!typ->isInteger()) {
+        error(expr->span, "cast type only supports integer");
+        return SemType::makeError();
+    }
+    return SemType::make(typ->kind);
 }
 
 SemTypePtr SemanticAnalyzer::checkPathExpr(PathExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    size_t segLen = expr->segments.size();
+    if(segLen > 2) {
+        error(expr->span, "Rx does not have modules or associated types");
+        return SemType::makeError();
+    }
+    if(segLen == 0) {
+        error(expr->span, "empty pathExpr");
+        return SemType::makeError();
+    }
+
+    if(segLen == 1) {
+        const auto &seg = expr->segments[0];
+        if(seg.isSelf) {
+            auto ret = scope.lookup("self");
+            if(ret == nullptr) {
+                error(expr->span, "self outside a method");
+                return SemType::makeError();
+            }
+            else {
+                return ret->type;
+            }
+        }
+        else if(seg.isSelfType) {
+            error(expr->span, "Self is not a value");
+            return SemType::makeError();
+        }
+        else {//normal ident
+            auto t1 = scope.lookup(seg.ident);
+            if(t1 != nullptr) {
+                return t1->type;
+            }
+            else {//global
+                auto t2 = lookupValue(seg.ident);
+                if(t2 != nullptr) {
+                    if(t2->kind == SymbolKind::Const) return t2->type;
+                    //fn is resolved by checkCallExpr, return Error silently
+                    return SemType::makeError();
+                }
+                else {
+                    error(expr->span, "unresolved name");
+                    return SemType::makeError();
+                }
+            }
+        }
+    }
+    else {//len = 2
+        const auto &s0 = expr->segments[0], &s1 = expr->segments[1];
+        if(s1.isSelf || s1.isSelfType || !s1.typeArgs.empty()) {
+            error(expr->span, "invalid pathExpr");
+            return SemType::makeError();
+        }
+        const StructDefItem* def = nullptr;
+        if(s0.isSelf) {
+            error(expr->span, "Rx does not have modules(self::)");
+            return SemType::makeError();
+        }
+        else if(s0.isSelfType) {
+            def = currentImplSelf;
+            if(def == nullptr) {
+                error(expr->span, "Self outside a struct or impl");
+                return SemType::makeError();
+            }
+        }
+        else {
+            auto structTyp = lookupType(s0.ident);
+            if(structTyp == nullptr || structTyp->kind != SymbolKind::Struct) {
+                error(expr->span, "struct in pathExpr does not exist");
+                return SemType::makeError();
+            }
+            def = static_cast<const StructDefItem*>(structTyp->decl);
+        }
+
+        auto it = structs.find(def);
+        if(it == structs.end()) {
+            error(expr->span, "struct in pathExpr does not exist");
+            return SemType::makeError();
+        }
+        auto tmp = it->second.members.find(s1.ident);
+        if(tmp == it->second.members.end()) {
+            error(expr->span, "associated value in pathExpr does not exist");
+            return SemType::makeError();
+        }
+
+        auto *mem = tmp->second;
+        if(mem->kind == SymbolKind::AssocConst) {
+            return mem->type;
+        }
+
+        //fn is resolved by checkCallExpr, return Error silently
+        return SemType::makeError();
+    }
 }
 
 SemTypePtr SemanticAnalyzer::checkFieldExpr(FieldExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
+    (void)expected;
+    auto base = checkExpr(expr->base.get(), scope, nullptr);
+    if(!base || base->isError()) {
+        return SemType::makeError();
+    }
+    while(base->kind == SemKind::Ref || base->kind == SemKind::Box) {
+        base = base->inner;
+    }
+    if(!base || base->isError()) {
+        return SemType::makeError();
+    }
+    if(base->kind != SemKind::Struct) {
+        error(expr->span, "invalid fieldExpr");
+        return SemType::makeError();
+    }
+    auto def = base->structDef;
+    auto it = structs.find(def);
+    if(it == structs.end()) {
+        error(expr->span, "struct in fieldExpr does not exist");
+        return SemType::makeError();
+    }
+    const StructInfo &info = it->second;
+    for(const auto &f : info.fields) {
+        if(f.name == expr->field) return f.type;
+    }
+    error(expr->span, "unknown field: " + expr->field);
     return SemType::makeError();
 }
 
