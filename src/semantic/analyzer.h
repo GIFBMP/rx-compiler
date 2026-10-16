@@ -23,6 +23,7 @@ struct Diagnostic {
 struct PlaceInfo {
     bool isPlace = false;
     bool isMut = false;//meaningful only when isPlace
+    bool gated = false;//reached through a shared reference or an immutably-accessed Vec index
 };
 
 struct FuncSig {
@@ -31,6 +32,18 @@ struct FuncSig {
     bool hasSelf = false;
     bool selfByRef = false;
     bool selfMut = false;
+};
+
+enum class ContainerArg { T, Usize };
+
+enum class ContainerRet { T, BoxT, VecT, Usize, Bool, Unit };
+
+struct ContainerMember {
+    bool hasSelf = false;
+    bool selfByRef = false;
+    bool selfMut = false;
+    std::vector<ContainerArg> params;
+    ContainerRet ret = ContainerRet::Unit;
 };
 
 struct StructInfo {
@@ -43,6 +56,7 @@ struct StructInfo {
     };
 
     std::vector<Field> fields;
+    std::unordered_map<std::string, std::size_t> fieldIndex;
     std::unordered_map<std::string, Symbol *> members;
     std::vector<Derive> derives;
 };
@@ -51,6 +65,7 @@ struct LoopCtx {
     SemTypePtr expected;
     std::vector<SemTypePtr> breaks;
     bool isWhile = false;
+    bool whileBarrier = false;
 };
 
 class SemanticAnalyzer {
@@ -71,6 +86,7 @@ public:
 
 private:
     void initBuiltins();
+    void initContainerMembers();
     void collectItems(Crate *crate);
     void collectStructNames(Crate *crate);
     void collectStructBody(StructDefItem *item);
@@ -79,6 +95,7 @@ private:
     void collectConst(ConstItem *item);
     void collectConstInImpl(ConstItem *item, StructInfo &info);
     void collectImpl(ImplItem *item);
+    void collectGeneratedClones();
 
     const Symbol *resolveConstPath(const PathExpr *path, bool report = true);
     void evaluateConst(Symbol *sym);
@@ -117,6 +134,18 @@ private:
     PlaceInfo placeInfo(Expr *expr, Scope &scope);
     SemTypePtr placeTypeOf(Expr *expr, Scope &scope);
 
+    Symbol *resolvePathSymbol(Expr *expr, Scope &scope);
+    Symbol *getContainerMember(const std::string &container, const std::string &name,
+                                       const ContainerMember &member, const SemTypePtr &T,
+                                       SourceSpan span);
+    Symbol *getStructClone(const StructDefItem *def, SourceSpan span);
+    Symbol *getBuiltinClone(const SemTypePtr &type, SourceSpan span);
+    Symbol *getArrayLen(const SemTypePtr &type, SourceSpan span);
+    Symbol *findMethod(const SemTypePtr &candidate, const std::string &name, SourceSpan span);
+    SemTypePtr checkCallArgs(const FuncSig *sig, std::size_t base,
+                             const std::vector<NodePtr<Expr>> &args, Scope &scope, SourceSpan span);
+    void checkReborrow(Expr *expr, const SemTypePtr &type, const SemTypePtr &expected, Scope &scope);
+
     SemTypePtr checkIntExpr(IntExpr *expr, Scope &scope, const SemTypePtr &expected);
     SemTypePtr checkBoolExpr(BoolExpr *expr, Scope &scope, const SemTypePtr &expected);
     SemTypePtr checkUnitExpr(UnitExpr *expr, Scope &scope, const SemTypePtr &expected);
@@ -149,6 +178,7 @@ private:
     std::unordered_map<const ImplItem *, const StructDefItem *> implTargets;
     std::unordered_map<const Symbol *, ConstValue> constValues;
     std::unordered_map<const Symbol *, FuncSig> sigs;
+    std::unordered_map<std::string, std::unordered_map<std::string, ContainerMember>> containerMembers;
     std::vector<std::unique_ptr<Symbol>> ownedSymbols;
 
     ConstEvaluator constEval;

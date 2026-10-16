@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+static bool placeDerefMut(const SemTypePtr &type, bool baseMut);
+
 bool SemanticAnalyzer::analyze(Crate *crate) {
     if(crate == nullptr) return false;
     initBuiltins();
@@ -84,6 +86,178 @@ void SemanticAnalyzer::initBuiltins() {//collect builtin members
     addFn("get_i32",     {}, SemType::make(SemKind::I32));
     addFn("print_i32",   {SemType::make(SemKind::I32)}, SemType::make(SemKind::Unit));
     addFn("println_i32", {SemType::make(SemKind::I32)}, SemType::make(SemKind::Unit));
+
+    initContainerMembers();
+}
+
+void SemanticAnalyzer::initContainerMembers() {
+    containerMembers["Box"]["new"]      = {false, false, false, {ContainerArg::T},     ContainerRet::BoxT};
+    containerMembers["Box"]["clone"]    = {true,  true,  false, {},                    ContainerRet::BoxT};
+    containerMembers["Vec"]["new"]      = {false, false, false, {},                    ContainerRet::VecT};
+    containerMembers["Vec"]["clone"]    = {true,  true,  false, {},                    ContainerRet::VecT};
+    containerMembers["Vec"]["len"]      = {true,  true,  false, {},                    ContainerRet::Usize};
+    containerMembers["Vec"]["is_empty"] = {true,  true,  false, {},                    ContainerRet::Bool};
+    containerMembers["Vec"]["push"]     = {true,  true,  true,  {ContainerArg::T},     ContainerRet::Unit};
+    containerMembers["Vec"]["remove"]   = {true,  true,  true,  {ContainerArg::Usize}, ContainerRet::T};
+}
+
+static SemTypePtr containerArgType(ContainerArg arg, const SemTypePtr &T) {
+    if(arg == ContainerArg::Usize) return SemType::make(SemKind::Usize);
+    return T;
+}
+
+static SemTypePtr containerRetType(ContainerRet ret, const SemTypePtr &T) {
+    switch(ret) {
+        case ContainerRet::T:     return T;
+        case ContainerRet::BoxT:  return SemType::makeContainer(SemKind::Box, T);
+        case ContainerRet::VecT:  return SemType::makeContainer(SemKind::Vec, T);
+        case ContainerRet::Usize: return SemType::make(SemKind::Usize);
+        case ContainerRet::Bool:  return SemType::make(SemKind::Bool);
+        case ContainerRet::Unit:  return SemType::makeUnit();
+    }
+    return SemType::makeUnit();
+}
+
+Symbol *SemanticAnalyzer::getContainerMember(const std::string &container, const std::string &name,
+                                                     const ContainerMember &member, const SemTypePtr &T,
+                                                     SourceSpan span) {
+    SemKind kind = container == "Box" ? SemKind::Box : SemKind::Vec;
+    auto sym = std::make_unique<Symbol>();
+    sym->name = name;
+    sym->kind = member.hasSelf ? SymbolKind::Method : SymbolKind::AssocFn;
+    sym->span = span;
+    if(member.hasSelf) {
+        sym->type = SemType::makeContainer(kind, T);
+    }
+    FuncSig sig;
+    sig.hasSelf = member.hasSelf;
+    sig.selfByRef = member.selfByRef;
+    sig.selfMut = member.selfMut;
+    for(ContainerArg arg : member.params) {
+        sig.params.push_back(containerArgType(arg, T));
+    }
+    sig.ret = containerRetType(member.ret, T);
+    Symbol *raw = sym.get();
+    ownedSymbols.push_back(std::move(sym));
+    sigs[raw] = std::move(sig);
+    return raw;
+}
+
+Symbol *SemanticAnalyzer::getStructClone(const StructDefItem *def, SourceSpan span) {
+    auto sym = std::make_unique<Symbol>();
+    sym->name = "clone";
+    sym->kind = SymbolKind::Method;
+    sym->span = span;
+    sym->type = SemType::makeStruct(def);
+    FuncSig sig;
+    sig.hasSelf = true;
+    sig.selfByRef = true;
+    sig.ret = SemType::makeStruct(def);
+    Symbol *raw = sym.get();
+    ownedSymbols.push_back(std::move(sym));
+    sigs[raw] = std::move(sig);
+    return raw;
+}
+
+Symbol *SemanticAnalyzer::getBuiltinClone(const SemTypePtr &type, SourceSpan span) {
+    auto sym = std::make_unique<Symbol>();
+    sym->name = "clone";
+    sym->kind = SymbolKind::Method;
+    sym->span = span;
+    sym->type = type;
+    FuncSig sig;
+    sig.hasSelf = true;
+    sig.selfByRef = true;
+    sig.ret = type;
+    Symbol *raw = sym.get();
+    ownedSymbols.push_back(std::move(sym));
+    sigs[raw] = std::move(sig);
+    return raw;
+}
+
+Symbol *SemanticAnalyzer::getArrayLen(const SemTypePtr &type, SourceSpan span) {
+    auto sym = std::make_unique<Symbol>();
+    sym->name = "len";
+    sym->kind = SymbolKind::Method;
+    sym->span = span;
+    sym->type = type;
+    FuncSig sig;
+    sig.hasSelf = true;
+    sig.selfByRef = true;
+    sig.ret = SemType::make(SemKind::Usize);
+    Symbol *raw = sym.get();
+    ownedSymbols.push_back(std::move(sym));
+    sigs[raw] = std::move(sig);
+    return raw;
+}
+
+Symbol *SemanticAnalyzer::findMethod(const SemTypePtr &candidate, const std::string &name, SourceSpan span) {
+    if(!candidate) return nullptr;
+    SemTypePtr type = candidate;
+    int form = 0;
+    if(type->kind == SemKind::Ref) {
+        form = type->isMut ? 2 : 1;
+        type = type->inner;
+    }
+    std::set<std::pair<const StructDefItem *, Derive>> vis;
+    switch(type->kind) {
+        case SemKind::Struct: {
+            auto it = structs.find(type->structDef);
+            if(it == structs.end()) return nullptr;
+            auto mit = it->second.members.find(name);
+            if(mit == it->second.members.end()) return nullptr;
+            Symbol *mem = mit->second;
+            if(mem->kind != SymbolKind::Method) return nullptr;
+            const FuncSig *sig = funcSig(mem);
+            if(sig == nullptr) return nullptr;
+            if(form == 0 && sig->selfByRef) return nullptr;
+            if(form == 1 && (!sig->selfByRef || sig->selfMut)) return nullptr;
+            if(form == 2 && (!sig->selfByRef || !sig->selfMut)) return nullptr;
+            return mem;
+        }
+        case SemKind::Box:
+        case SemKind::Vec: {
+            if(form == 0) return nullptr;
+            std::string container = type->kind == SemKind::Box ? "Box" : "Vec";
+            auto cit = containerMembers.find(container);
+            if(cit == containerMembers.end()) return nullptr;
+            auto mit = cit->second.find(name);
+            if(mit == cit->second.end()) return nullptr;
+            const ContainerMember &mem = mit->second;
+            if(!mem.hasSelf || mem.selfMut != (form == 2)) return nullptr;
+            if(name == "clone" && !typeSupportsDerive(type->inner, Derive::Clone, vis)) return nullptr;
+            return getContainerMember(container, name, mem, type->inner, span);
+        }
+        case SemKind::Array: {
+            if(form != 1) return nullptr;
+            if(name == "len") return getArrayLen(type, span);
+            if(name == "clone" && typeSupportsDerive(type->elem, Derive::Clone, vis)) return getBuiltinClone(type, span);
+            return nullptr;
+        }
+        case SemKind::I32:
+        case SemKind::U32:
+        case SemKind::Isize:
+        case SemKind::Usize:
+        case SemKind::Bool: {
+            if(form == 1 && name == "clone") return getBuiltinClone(type, span);
+            return nullptr;
+        }
+        case SemKind::Ref: {
+            if(form == 1 && name == "clone" && !type->isMut) return getBuiltinClone(type, span);
+            return nullptr;
+        }
+        default:
+            return nullptr;
+    }
+}
+
+void SemanticAnalyzer::collectGeneratedClones() {
+    for(auto &pair: structs) {
+        StructInfo &info = pair.second;
+        if(!structHasDerive(pair.first, Derive::Clone)) continue;
+        if(info.members.find("clone") != info.members.end()) continue;
+        info.members["clone"] = getStructClone(pair.first, pair.first->span);
+    }
 }
 
 void SemanticAnalyzer::collectItems(Crate *crate) {
@@ -119,6 +293,8 @@ void SemanticAnalyzer::collectItems(Crate *crate) {
             collectImpl(static_cast<ImplItem*>(it.get()));
         }
     }
+
+    collectGeneratedClones();
 
     for(auto &pair: globals) {
         if(pair.second->kind == SymbolKind::Const) {
@@ -159,6 +335,7 @@ void SemanticAnalyzer::collectStructBody(StructDefItem *item) {
         if(!vis.insert(field->name).second) {
             error(field->span, "duplicate field: " + field->name);
         }
+        info.fieldIndex.emplace(field->name, info.fields.size());
         info.fields.push_back({field->name, tmp, field->span});
     }
     info.derives = item->derives;
@@ -235,6 +412,9 @@ void SemanticAnalyzer::collectFuncInImpl(FuncDefItem *item, StructInfo &info) {
     }
     sig.ret = item->returnType ? checkType(item->returnType.get()) : SemType::make(SemKind::Unit);
     sym->kind = sig.hasSelf ? SymbolKind::Method : SymbolKind::AssocFn;
+    if(sig.hasSelf) {
+        sym->type = SemType::makeStruct(info.def);
+    }
 
     Symbol *raw = declareMember(info, std::move(sym));
     if(raw) {
@@ -794,6 +974,7 @@ SemTypePtr SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
                !initType->isNever() && !canCoerce(initType, assignType)) {
                 error(st->span, "initializer type does not match the expected type");
             }
+            checkReborrow(st->init.get(), initType, assignType, scope);
             auto sym = std::make_unique<Symbol>();
             sym->name = st->name;
             sym->kind = SymbolKind::Local;
@@ -1246,97 +1427,16 @@ SemTypePtr SemanticAnalyzer::checkCastExpr(CastExpr *expr, Scope &scope, const S
 
 SemTypePtr SemanticAnalyzer::checkPathExpr(PathExpr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)expected;
-    size_t segLen = expr->segments.size();
-    if(segLen > 2) {
-        error(expr->span, "Rx does not have modules or associated types");
+    Symbol *sym = resolvePathSymbol(expr, scope);
+    if(sym == nullptr) {
         return SemType::makeError();
     }
-    if(segLen == 0) {
-        error(expr->span, "empty pathExpr");
+    if(sym->kind == SymbolKind::Fn || sym->kind == SymbolKind::BuiltinFn ||
+       sym->kind == SymbolKind::AssocFn || sym->kind == SymbolKind::Method) {
+        error(expr->span, "func is not a value");
         return SemType::makeError();
     }
-
-    if(segLen == 1) {
-        const auto &seg = expr->segments[0];
-        if(seg.isSelf) {
-            auto ret = scope.lookup("self");
-            if(ret == nullptr) {
-                error(expr->span, "self outside a method");
-                return SemType::makeError();
-            }
-            else {
-                return ret->type;
-            }
-        }
-        else if(seg.isSelfType) {
-            error(expr->span, "Self is not a value");
-            return SemType::makeError();
-        }
-        else {//normal ident
-            auto t1 = scope.lookup(seg.ident);
-            if(t1 != nullptr) {
-                return t1->type;
-            }
-            else {//global
-                auto t2 = lookupValue(seg.ident);
-                if(t2 != nullptr) {
-                    if(t2->kind == SymbolKind::Const) return t2->type;
-                    //fn is resolved by checkCallExpr, return Error silently
-                    return SemType::makeError();
-                }
-                else {
-                    error(expr->span, "unresolved name");
-                    return SemType::makeError();
-                }
-            }
-        }
-    }
-    else {//len = 2
-        const auto &s0 = expr->segments[0], &s1 = expr->segments[1];
-        if(s1.isSelf || s1.isSelfType || !s1.typeArgs.empty()) {
-            error(expr->span, "invalid pathExpr");
-            return SemType::makeError();
-        }
-        const StructDefItem* def = nullptr;
-        if(s0.isSelf) {
-            error(expr->span, "Rx does not have modules(self::)");
-            return SemType::makeError();
-        }
-        else if(s0.isSelfType) {
-            def = currentImplSelf;
-            if(def == nullptr) {
-                error(expr->span, "Self outside a struct or impl");
-                return SemType::makeError();
-            }
-        }
-        else {
-            auto structTyp = lookupType(s0.ident);
-            if(structTyp == nullptr || structTyp->kind != SymbolKind::Struct) {
-                error(expr->span, "struct in pathExpr does not exist");
-                return SemType::makeError();
-            }
-            def = static_cast<const StructDefItem*>(structTyp->decl);
-        }
-
-        auto it = structs.find(def);
-        if(it == structs.end()) {
-            error(expr->span, "struct in pathExpr does not exist");
-            return SemType::makeError();
-        }
-        auto tmp = it->second.members.find(s1.ident);
-        if(tmp == it->second.members.end()) {
-            error(expr->span, "associated value in pathExpr does not exist");
-            return SemType::makeError();
-        }
-
-        auto *mem = tmp->second;
-        if(mem->kind == SymbolKind::AssocConst) {
-            return mem->type;
-        }
-
-        //fn is resolved by checkCallExpr, return Error silently
-        return SemType::makeError();
-    }
+    return sym->type;
 }
 
 SemTypePtr SemanticAnalyzer::checkFieldExpr(FieldExpr *expr, Scope &scope, const SemTypePtr &expected) {
@@ -1359,11 +1459,12 @@ SemTypePtr SemanticAnalyzer::checkFieldExpr(FieldExpr *expr, Scope &scope, const
         return SemType::makeError();
     }
     const StructInfo &info = it->second;
-    for(const auto &f : info.fields) {
-        if(f.name == expr->field) return f.type;
+    auto fit = info.fieldIndex.find(expr->field);
+    if(fit == info.fieldIndex.end()) {
+        error(expr->span, "unknown field: " + expr->field);
+        return SemType::makeError();
     }
-    error(expr->span, "unknown field: " + expr->field);
-    return SemType::makeError();
+    return info.fields[fit->second].type;
 }
 
 SemTypePtr SemanticAnalyzer::checkIndexExpr(IndexExpr *expr, Scope &scope, const SemTypePtr &expected) {
@@ -1395,19 +1496,277 @@ SemTypePtr SemanticAnalyzer::checkIndexExpr(IndexExpr *expr, Scope &scope, const
     }
 }
 
+Symbol* SemanticAnalyzer::resolvePathSymbol(Expr *expr, Scope &scope) {
+    if(expr->typ != NodeType::PathExpr) {
+        error(expr->span, "not a pathExpr");
+        return nullptr;
+    }
+    auto *path = static_cast<PathExpr*>(expr);
+    size_t segLen = path->segments.size();
+    if(segLen > 2) {
+        error(expr->span, "Rx does not have modules or associated types");
+        return nullptr;
+    }
+    if(segLen == 0) {
+        error(expr->span, "empty pathExpr");
+        return nullptr;
+    }
+
+    if(segLen == 1) {
+        const auto &seg = path->segments[0];
+        if(seg.isSelf) {
+            auto ret = scope.lookup("self");
+            if(ret == nullptr) {
+                error(expr->span, "self outside a method");
+                return nullptr;
+            }
+            return ret;
+        }
+        if(seg.isSelfType) {
+            error(expr->span, "Self is not a value");
+            return nullptr;
+        }
+        if(!seg.typeArgs.empty()) {
+            error(expr->span, "functions have no type parameters");
+            return nullptr;
+        }
+        auto t1 = scope.lookup(seg.ident);
+        if(t1 != nullptr) {
+            return t1;
+        }
+        auto t2 = lookupValue(seg.ident);
+        if(t2 == nullptr) {
+            error(expr->span, "unresolved name");
+            return nullptr;
+        }
+        return t2;
+    }
+
+    const auto &s0 = path->segments[0], &s1 = path->segments[1];
+    if(s1.isSelf || s1.isSelfType || !s1.typeArgs.empty()) {
+        error(expr->span, "invalid pathExpr");
+        return nullptr;
+    }
+    const StructDefItem* def = nullptr;
+    if(s0.isSelf) {
+        error(expr->span, "Rx does not have modules(self::)");
+        return nullptr;
+    }
+    else if(s0.isSelfType) {
+        def = currentImplSelf;
+        if(def == nullptr) {
+            error(expr->span, "Self outside a struct or impl");
+            return nullptr;
+        }
+    }
+    else {
+        auto cit = containerMembers.find(s0.ident);
+        if(cit != containerMembers.end()) {
+            if(s0.typeArgs.empty()) {
+                return nullptr;
+            }
+            if(s0.typeArgs.size() != 1) {
+                error(expr->span, "container type expects one type argument");
+                return nullptr;
+            }
+            auto mit = cit->second.find(s1.ident);
+            if(mit == cit->second.end()) {
+                error(expr->span, "no associated item: " + s1.ident);
+                return nullptr;
+            }
+            SemTypePtr T = checkType(s0.typeArgs[0].get());
+            if(!T || T->isError()) {
+                return nullptr;
+            }
+            if(s1.ident == "clone") {
+                std::set<std::pair<const StructDefItem *, Derive>> vis;
+                if(!typeSupportsDerive(T, Derive::Clone, vis)) {
+                    error(expr->span, "clone requires a Clone element type");
+                    return nullptr;
+                }
+            }
+            return getContainerMember(s0.ident, s1.ident, mit->second, T, expr->span);
+        }
+        auto structTyp = lookupType(s0.ident);
+        if(structTyp == nullptr || structTyp->kind != SymbolKind::Struct) {
+            error(expr->span, "struct in pathExpr does not exist");
+            return nullptr;
+        }
+        def = static_cast<const StructDefItem*>(structTyp->decl);
+    }
+
+    auto it = structs.find(def);
+    if(it == structs.end()) {
+        error(expr->span, "struct in pathExpr does not exist");
+        return nullptr;
+    }
+    auto tmp = it->second.members.find(s1.ident);
+    if(tmp == it->second.members.end()) {
+        error(expr->span, "associated value in pathExpr does not exist");
+        return nullptr;
+    }
+
+    return tmp->second;
+}
+
 SemTypePtr SemanticAnalyzer::checkCallExpr(CallExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    Symbol *sym = resolvePathSymbol(expr->callee.get(), scope);
+    if(sym == nullptr) {
+        return SemType::makeError();
+    }
+    const FuncSig *sig = funcSig(sym);
+    if(sig == nullptr) {
+        error(expr->span, "not callable");
+        return SemType::makeError();
+    }
+    size_t base = sig->hasSelf ? 1 : 0;
+    if(sig->hasSelf && !expr->args.empty()) {
+        SemTypePtr recv = sig->selfByRef ? SemType::makeRef(sym->type, sig->selfMut) : sym->type;
+        auto arg = checkExpr(expr->args[0].get(), scope, recv);
+        if(recv && !recv->isError() && arg && !arg->isError() &&
+           !arg->isNever() && !canCoerce(arg, recv)) {
+            error(expr->args[0]->span, "receiver type does not match");
+        }
+    }
+    return checkCallArgs(sig, base, expr->args, scope, expr->span);
+}
+
+SemTypePtr SemanticAnalyzer::checkCallArgs(const FuncSig *sig, std::size_t base,
+                                           const std::vector<NodePtr<Expr>> &args,
+                                           Scope &scope, SourceSpan span) {
+    std::size_t len = sig->params.size() + base;
+    if(args.size() < len) {
+        error(span, "too few arguments");
+    }
+    else if(args.size() > len) {
+        error(span, "too many arguments");
+    }
+    for(size_t i = 0; i < sig->params.size() && i + base < args.size(); i++) {
+        const SemTypePtr &paramType = sig->params[i];
+        auto arg = checkExpr(args[i + base].get(), scope, paramType);
+        if(paramType && !paramType->isError() && arg && !arg->isError() &&
+           !arg->isNever() && !canCoerce(arg, paramType)) {
+            error(args[i + base]->span, "argument type does not match");
+        }
+        checkReborrow(args[i + base].get(), arg, paramType, scope);
+    }
+    return sig->ret;
+}
+
+void SemanticAnalyzer::checkReborrow(Expr *expr, const SemTypePtr &type,
+                                     const SemTypePtr &expected, Scope &scope) {
+    if(!expected || expected->kind != SemKind::Ref || !expected->isMut) return;
+    if(!type || type->kind != SemKind::Ref || !type->isMut) return;
+    PlaceInfo place = placeInfo(expr, scope);
+    if(place.isPlace && place.gated) {
+        error(expr->span, "cannot reborrow a mutable reference through an immutable access");
+    }
 }
 
 SemTypePtr SemanticAnalyzer::checkMethodCallExpr(MethodCallExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    if(!expr->methodTypeArgs.empty()) {
+        error(expr->span, "method segments have no type parameters");
+        return SemType::makeError();
+    }
+    SemTypePtr recvType = checkExpr(expr->receiver.get(), scope, nullptr);
+    if(!recvType || recvType->isError()) {
+        return SemType::makeError();
+    }
+    Symbol *sym = nullptr;
+    SemTypePtr cur = recvType;
+    while(true) {//candidate chain(because receiver can have several forms: &mut, &, ...)
+        sym = findMethod(cur, expr->method, expr->span);
+        if(sym == nullptr) {
+            sym = findMethod(SemType::makeRef(cur, false), expr->method, expr->span);
+        }
+        if(sym == nullptr) {
+            sym = findMethod(SemType::makeRef(cur, true), expr->method, expr->span);
+        }
+        if(sym != nullptr) break;
+        if(cur->kind == SemKind::Ref || cur->kind == SemKind::Box) cur = cur->inner;
+        else break;
+    }
+    if(sym == nullptr) {
+        error(expr->span, "no matching method: " + expr->method);
+        return SemType::makeError();
+    }
+    const FuncSig *sig = funcSig(sym);
+    if(sig == nullptr) {
+        return SemType::makeError();
+    }
+    if(sig->hasSelf && sig->selfMut) {
+        PlaceInfo place = placeInfo(expr->receiver.get(), scope);
+        if(place.isPlace && (place.gated || !placeDerefMut(recvType, place.isMut))) {
+            error(expr->span, "mutable receiver needs a mutable place");
+        }
+    }
+    return checkCallArgs(sig, 0, expr->args, scope, expr->span);
 }
 
 SemTypePtr SemanticAnalyzer::checkStructExpr(StructExpr *expr, Scope &scope, const SemTypePtr &expected) {
-    (void)expr; (void)scope; (void)expected;
-    return SemType::makeError();
+    (void)expected;
+    const auto &segs = expr->path->segments;
+    if(segs.size() != 1) {
+        error(expr->span, "invalid struct construction path");
+        return SemType::makeError();
+    }
+    const StructDefItem *def = nullptr;
+    const PathSegment &seg = segs[0];
+    if(seg.isSelfType) {
+        def = currentImplSelf;
+        if(def == nullptr) {
+            error(expr->span, "Self outside a struct or impl");
+            return SemType::makeError();
+        }
+    }
+    else if(seg.isSelf) {
+        error(expr->span, "self is not a type");
+        return SemType::makeError();
+    }
+    else {
+        Symbol *ts = lookupType(seg.ident);
+        if(ts == nullptr || ts->kind != SymbolKind::Struct) {
+            error(expr->span, "not a struct: " + seg.ident);
+            return SemType::makeError();
+        }
+        def = static_cast<const StructDefItem *>(ts->decl);
+    }
+    auto it = structs.find(def);
+    if(it == structs.end()) {
+        error(expr->span, "unknown struct");
+        return SemType::makeError();
+    }
+    const StructInfo &info = it->second;
+
+    std::vector<bool> vis(info.fields.size(), false);
+    for(auto &tmp: expr->fields) {
+        auto *field = tmp.get();
+        auto fit = info.fieldIndex.find(field->name);
+        if(fit == info.fieldIndex.end()) {
+            error(field->span, "unknown field: " + field->name);
+            continue;
+        }
+        std::size_t idx = fit->second;
+        if(vis[idx]) {
+            error(field->span, "duplicate field: " + field->name);
+            continue;
+        }
+        vis[idx] = true;
+        const SemTypePtr &fieldType = info.fields[idx].type;
+        auto val = checkExpr(field->value.get(), scope, fieldType);
+        if(fieldType && !fieldType->isError() && val && !val->isError() &&
+           !val->isNever() && !canCoerce(val, fieldType)) {
+            error(field->value->span, "field initializer type does not match the field type");
+        }
+    }
+    for(std::size_t i = 0; i < info.fields.size(); i++) {
+        if(!vis[i]) {
+            error(expr->span, "missing field: " + info.fields[i].name);
+        }
+    }
+    return SemType::makeStruct(def);
 }
 
 SemTypePtr SemanticAnalyzer::checkArrayExpr(ArrayExpr *expr, Scope &scope, const SemTypePtr &expected) {
@@ -1490,13 +1849,16 @@ SemTypePtr SemanticAnalyzer::checkIfExpr(IfExpr *expr, Scope &scope, const SemTy
 
 SemTypePtr SemanticAnalyzer::checkWhileExpr(WhileExpr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)expected;
+    loopStack.push_back(LoopCtx{nullptr, {}, false, true});
     SemTypePtr cond = checkExpr(expr->cond.get(), scope, SemType::make(SemKind::Bool));
     if(cond && !cond->isError() && !cond->isNever() && cond->kind != SemKind::Bool) {
         error(expr->cond->span, "while condition must be bool");
     }
+    loopStack.pop_back();
     loopStack.push_back(LoopCtx{nullptr, {}, true});
     auto bodyType = checkBlockExpr(expr->body.get(), scope, SemType::makeUnit());
     if(!bodyType || bodyType->isError()) {
+        loopStack.pop_back();
         return SemType::makeError();
     }
     loopStack.pop_back();
@@ -1565,8 +1927,8 @@ SemTypePtr SemanticAnalyzer::checkReturnExpr(ReturnExpr *expr, Scope &scope, con
 
 SemTypePtr SemanticAnalyzer::checkBreakExpr(BreakExpr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)expected;
-    if(loopStack.empty()) {
-        error(expr->span, "break outside a loop");
+    if(loopStack.empty() || loopStack.back().whileBarrier) {
+        error(expr->span, "break outside a loop or in while cond");
         return SemType::makeError();
     }
     bool isWhile = loopStack.back().isWhile;
@@ -1594,8 +1956,8 @@ SemTypePtr SemanticAnalyzer::checkBreakExpr(BreakExpr *expr, Scope &scope, const
 SemTypePtr SemanticAnalyzer::checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected) {
     (void)scope;
     (void)expected;
-    if(loopStack.empty()) {
-        error(expr->span, "continue outside a loop");
+    if(loopStack.empty() || loopStack.back().whileBarrier) {
+        error(expr->span, "continue outside a loop or in while cond");
         return SemType::makeError();
     }
     return SemType::makeNever();
@@ -1613,6 +1975,21 @@ static bool placeDerefMut(const SemTypePtr &type, bool baseMut) {
         t = t->inner;
     }
     return hasRef ? allMut : baseMut;
+}
+
+static bool crossesShared(const SemTypePtr &type) {
+    SemTypePtr t = type;
+    while(t && (t->kind == SemKind::Ref || t->kind == SemKind::Box)) {
+        if(t->kind == SemKind::Ref && !t->isMut) return true;
+        t = t->inner;
+    }
+    return false;
+}
+
+static bool underlyingVec(const SemTypePtr &type) {
+    SemTypePtr t = type;
+    while(t && (t->kind == SemKind::Ref || t->kind == SemKind::Box)) t = t->inner;
+    return t && t->kind == SemKind::Vec;
 }
 
 PlaceInfo SemanticAnalyzer::placeInfo(Expr *expr, Scope &scope) {
@@ -1634,37 +2011,50 @@ PlaceInfo SemanticAnalyzer::placeInfo(Expr *expr, Scope &scope) {
                 if(sym == nullptr) sym = lookupValue(seg.ident);
             }
             if(sym == nullptr || !sym->isPlace) return {};
-            return {true, sym->isMut};
+            return {true, sym->isMut, false};
         }
         case NodeType::FieldExpr: {
             auto *field = static_cast<FieldExpr*>(expr);
             PlaceInfo base = placeInfo(field->base.get(), scope);
             if(!base.isPlace) {
-                return {true, true};//a field of an rvalue temporary is a mutable place
+                return {true, true, false};//a field of an rvalue temporary is a mutable place
             }
-            return {true, placeDerefMut(placeTypeOf(field->base.get(), scope), base.isMut)};
+            if(base.gated) {
+                return {true, false, true};
+            }
+            SemTypePtr bt = placeTypeOf(field->base.get(), scope);
+            bool mut = placeDerefMut(bt, base.isMut);
+            return {true, mut, crossesShared(bt) || (underlyingVec(bt) && !mut)};
         }
         case NodeType::IndexExpr: {
             auto *index = static_cast<IndexExpr*>(expr);
             PlaceInfo base = placeInfo(index->base.get(), scope);
             if(!base.isPlace) {
-                return {true, true};
+                return {true, true, false};
             }
-            return {true, placeDerefMut(placeTypeOf(index->base.get(), scope), base.isMut)};
+            if(base.gated) {
+                return {true, false, true};
+            }
+            SemTypePtr bt = placeTypeOf(index->base.get(), scope);
+            bool mut = placeDerefMut(bt, base.isMut);
+            return {true, mut, crossesShared(bt) || (underlyingVec(bt) && !mut)};
         }
         case NodeType::UnaryExpr: {
             auto *unary = static_cast<UnaryExpr*>(expr);
             if(unary->op != UnaryOp::Deref) return {};
+            PlaceInfo base = placeInfo(unary->num.get(), scope);
+            if(base.gated) {
+                return {true, false, true};
+            }
             SemTypePtr t = placeTypeOf(unary->num.get(), scope);
             if(!t || t->isError()) {//unknown operand type: assume mutable
-                return {true, true};
+                return {true, true, false};
             }
-            if(t->kind == SemKind::Ref) {//&mut x/&x deref to a place
-                return {true, t->isMut};
+            if(t->kind == SemKind::Ref) {//&mut x/&x deref to a place; a shared deref gates below
+                return {true, t->isMut, !t->isMut};
             }
             if(t->kind == SemKind::Box) {
-                PlaceInfo base = placeInfo(unary->num.get(), scope);
-                return {true, base.isMut};//a Box inherits its owner place's mutability
+                return {true, base.isMut, base.gated};//a Box inherits its owner place's mutability
             }
             return {};//scalars/Vec/ ... are not dereferenceable
         }
@@ -1691,6 +2081,33 @@ SemTypePtr SemanticAnalyzer::placeTypeOf(Expr *expr, Scope &scope) {
                 if(sym == nullptr) sym = lookupValue(seg.ident);
             }
             return sym ? sym->type : nullptr;
+        }
+        case NodeType::FieldExpr: {
+            auto *field = static_cast<FieldExpr*>(expr);
+            SemTypePtr base = placeTypeOf(field->base.get(), scope);
+            while(base && (base->kind == SemKind::Ref || base->kind == SemKind::Box)) base = base->inner;
+            if(!base || base->kind != SemKind::Struct) return nullptr;
+            auto it = structs.find(base->structDef);
+            if(it == structs.end()) return nullptr;
+            auto fit = it->second.fieldIndex.find(field->field);
+            if(fit == it->second.fieldIndex.end()) return nullptr;
+            return it->second.fields[fit->second].type;
+        }
+        case NodeType::IndexExpr: {
+            auto *index = static_cast<IndexExpr*>(expr);
+            SemTypePtr base = placeTypeOf(index->base.get(), scope);
+            while(base && (base->kind == SemKind::Ref || base->kind == SemKind::Box)) base = base->inner;
+            if(!base) return nullptr;
+            if(base->kind == SemKind::Array) return base->elem;
+            if(base->kind == SemKind::Vec) return base->inner;
+            return nullptr;
+        }
+        case NodeType::UnaryExpr: {
+            auto *unary = static_cast<UnaryExpr*>(expr);
+            if(unary->op != UnaryOp::Deref) return nullptr;
+            SemTypePtr t = placeTypeOf(unary->num.get(), scope);
+            if(t && (t->kind == SemKind::Ref || t->kind == SemKind::Box)) return t->inner;
+            return nullptr;
         }
         default:
             return nullptr;
