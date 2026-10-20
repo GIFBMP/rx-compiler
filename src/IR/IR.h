@@ -1,6 +1,6 @@
 #pragma once
 
-enum class IRType {
+enum class IRKind {
     Void, 
     I1, //Bool
     I8, //to process print_i32/println_i32/get_i32->format string
@@ -8,4 +8,8 @@ enum class IRType {
     Ptr,
     Array,
     Struct,
+};
+
+struct IRType {
+
 };

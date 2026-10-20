@@ -11,11 +11,12 @@
 
 class Scope {
 public:
-    explicit Scope(Scope *parent = nullptr)
-        : parent(parent), arena(parent ? parent->arena : nullptr) {}
+    explicit Scope(std::vector<std::unique_ptr<Symbol>> &arena) : arena(&arena) {}
 
-    Scope(Scope *parent, std::vector<std::unique_ptr<Symbol>> &arena)
-        : parent(parent), arena(&arena) {}
+    explicit Scope(Scope *parent) : parent(parent), arena(parent->arena) {}
+
+    Scope(const Scope &) = delete;
+    Scope &operator=(const Scope &) = delete;
 
     Symbol *lookupLocal(const std::string &name) const {
         auto it = names.find(name);
@@ -34,12 +35,7 @@ public:
     Symbol *define(std::unique_ptr<Symbol> sym) {
         Symbol *raw = sym.get();
         names[raw->name] = raw;
-        if(arena != nullptr) {
-            arena->push_back(std::move(sym));
-        }
-        else {
-            owned.push_back(std::move(sym));
-        }
+        arena->push_back(std::move(sym));
         return raw;
     }
 
@@ -48,8 +44,8 @@ public:
     }
 
 private:
-    Scope *parent;
+    Scope *parent = nullptr;
     std::vector<std::unique_ptr<Symbol>> *arena = nullptr;
+    //arena: keep the ptr of Symbols after the Scope is deconstructed
     std::unordered_map<std::string, Symbol *> names;
-    std::vector<std::unique_ptr<Symbol>> owned;
 };

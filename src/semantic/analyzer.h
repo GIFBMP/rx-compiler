@@ -151,6 +151,8 @@ private:
     SemTypePtr checkBreakExpr(BreakExpr *expr, Scope &scope, const SemTypePtr &expected);
     SemTypePtr checkContinueExpr(ContinueExpr *expr, Scope &scope, const SemTypePtr &expected);
 
+    TypeLayout layoutOf(const SemTypePtr &type) const;
+
     std::vector<Diagnostic> diags;
     std::vector<LoopCtx> loopStack;
 

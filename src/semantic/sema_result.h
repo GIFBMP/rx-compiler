@@ -18,6 +18,11 @@ struct FuncSig {
     bool selfMut = false;
 };
 
+struct TypeLayout {
+    size_t size = 0;
+    size_t align = 1;
+};
+
 struct StructInfo {
     const StructDefItem *def = nullptr;
 
@@ -31,7 +36,14 @@ struct StructInfo {
     std::unordered_map<std::string, std::size_t> fieldIndex;
     std::unordered_map<std::string, Symbol *> members;
     std::vector<Derive> derives;
+
+    std::vector<size_t> fieldOffsets;
+    TypeLayout layout;
 };
+
+inline size_t alignTo(size_t val, size_t align) {// val -> real address(aligned)
+    return (val + align - 1) / align * align;
+}
 
 struct MethodAdjust {
     int derefs = 0;

@@ -650,6 +650,18 @@ bool SemanticAnalyzer::layoutDfs(const StructDefItem *def, std::unordered_map<co
                 if(c == 0 && layoutDfs(child, color)) return true;
             }
         }
+        StructInfo &out = result.structs[def];
+        out.fieldOffsets.assign(out.fields.size(), 0);
+        size_t offset = 0, align = 1;
+        for(size_t i = 0; i < out.fields.size(); i++) {
+            TypeLayout field = layoutOf(out.fields[i].type);
+            offset = alignTo(offset, field.align);
+            out.fieldOffsets[i] = offset;
+            offset += field.size;
+            if(field.align > align) align = field.align;//maxsize of struct members
+        }
+        out.layout.align = align;
+        out.layout.size = alignTo(offset, align);
     }
     color[def] = 2;
     return false;
@@ -906,7 +918,7 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
     }
     const FuncSig *sig = funcSym ? funcSig(funcSym) : nullptr;
 
-    Scope scope(nullptr, result.ownedSymbols);
+    Scope scope(result.ownedSymbols);
     size_t pos = 0;//index into sig->params (not including self)
     for(auto &it: item->params) {
         auto *param = it.get();
@@ -2154,5 +2166,49 @@ SemTypePtr SemanticAnalyzer::placeTypeOf(Expr *expr, Scope &scope) {
         }
         default:
             return nullptr;
+    }
+}
+
+TypeLayout SemanticAnalyzer::layoutOf(const SemTypePtr &type) const {
+    if(type == nullptr) {
+        return {0, 1};
+    }
+    switch(type->kind) {
+        case SemKind::I32:
+        case SemKind::U32:
+        case SemKind::Isize:
+        case SemKind::Usize: {
+            return {4, 4};
+        }
+        case SemKind::Bool: {
+            return {1, 1};
+        }
+        case SemKind::Unit:
+        case SemKind::Never: {
+            return {0, 1};
+        }
+        case SemKind::Box://32 bit sys, 4 byte
+        case SemKind::Ref: {
+            return {4, 4};
+        }
+        case SemKind::Vec: {//{data_ptr, len, cap}
+            return {12, 4};
+        }
+        case SemKind::Array: {
+            TypeLayout elem = layoutOf(type->elem);
+            return {elem.size * type->arrayLen, elem.align};
+        }
+        case SemKind::Struct: {
+            auto it = result.structs.find(type->structDef);
+            if(it == result.structs.end()) {
+                return {0, 1};
+            }
+            else {
+                return it->second.layout;
+            }
+        }
+        default: {
+            return {0, 1};
+        }
     }
 }
