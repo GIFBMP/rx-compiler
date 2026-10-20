@@ -988,7 +988,6 @@ SemTypePtr SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
                !initType->isNever() && !canCoerce(initType, assignType)) {
                 error(st->span, "initializer type does not match the expected type");
             }
-            checkReborrow(st->init.get(), initType, assignType, scope);
             auto sym = std::make_unique<Symbol>();
             sym->name = st->name;
             sym->kind = SymbolKind::Local;
@@ -1023,6 +1022,7 @@ SemTypePtr SemanticAnalyzer::checkExpr(Expr *expr, Scope &scope, const SemTypePt
     }
     SemTypePtr ret = checkExprNode(expr, scope, expected);
     result.exprTypes[expr] = ret;
+    checkReborrow(expr, ret, expected, scope);
     return ret;
 }
 
@@ -1679,7 +1679,6 @@ SemTypePtr SemanticAnalyzer::checkCallArgs(const FuncSig *sig, std::size_t base,
            !arg->isNever() && !canCoerce(arg, paramType)) {
             error(args[i + base]->span, "argument type does not match");
         }
-        checkReborrow(args[i + base].get(), arg, paramType, scope);
     }
     return sig->ret;
 }

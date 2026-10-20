@@ -1,0 +1,26 @@
+[
+  {
+    "source": "rej-assignment-reborrow-through-immutable-vec.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Reborrowing a &mut place out of an immutably-accessed Vec on an assignment RHS must be rejected."
+  },
+  {
+    "source": "acc-assignment-reborrow-through-mutable-vec.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "Reborrowing on an assignment RHS is allowed when the Vec is mutably accessible."
+  },
+  {
+    "source": "acc-assignment-reborrow-direct-mut.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "Reborrowing a direct &mut place on an assignment RHS is allowed."
+  },
+  {
+    "source": "acc-assignment-shared-coercion-through-immutable-vec.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "A &mut to & shared coercion on an assignment RHS does not require mutable Vec access."
+  }
+]

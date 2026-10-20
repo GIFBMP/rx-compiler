@@ -7,8 +7,6 @@
 #include "RxLexer.h"
 #include "RxParser.h"
 #include "AST/AstBuilder.h"
-#include "AST/AstCheck.h"
-#include "AST/AstDumper.h"
 #include "semantic/analyzer.h"
 
 static std::string readAll(std::istream &in) {
@@ -62,40 +60,30 @@ int main(int argc, char **argv) {
         if(stage == "parse") {
             return 0;
         }
+        auto *crate = dynamic_cast<Crate*>(ast.get());
+        if(crate == nullptr) {
+            std::cerr << "semantic stage requires a crate entry\n";
+            return 1;
+        }
+        SemanticAnalyzer analyzer;
+        bool ok = analyzer.analyze(crate);
+        for(const Diagnostic &d : analyzer.diagnostics()) {
+            std::cerr << d.span.beginLine << ":" << d.span.beginCol
+                        << ": error: " << d.message << "\n";
+        }
         if(stage == "semantic") {
-            auto *crate = dynamic_cast<Crate*>(ast.get());
-            if(crate == nullptr) {
-                std::cerr << "semantic stage requires a crate entry\n";
+            return ok ? 0 : 1;
+        }
+        if(stage == "ir") {
+            if(ok == false) {
+                std::cerr << "invalid semantic\n";
                 return 1;
             }
-            SemanticAnalyzer analyzer;
-            bool ok = analyzer.analyze(crate);
-            for(const Diagnostic &d : analyzer.diagnostics()) {
-                std::cerr << d.span.beginLine << ":" << d.span.beginCol
-                          << ": error: " << d.message << "\n";
-            }
-            return ok ? 0 : 1;
+            
         }
         std::cerr << "unsupported stage: " << stage << "\n";
         return 1;
     }
-
-    if(checkMode) {
-        std::vector<std::string> errors = astcheck::check(ast.get());
-        if(!errors.empty()) {
-            for(size_t i = 0; i < errors.size() && i < 10; i++) {
-                std::cerr << "CHECK: " << errors[i] << "\n";
-            }
-            if(errors.size() > 10) {
-                std::cerr << "CHECK: ... " << (errors.size() - 10) << " more\n";
-            }
-            return 3;
-        }
-        return 0;
-    }
-
-    std::cout << "AST OK (entry=" << entry << ")\n";
-    astdump::dump(ast.get(), std::cout);
 
     return 0;
 }

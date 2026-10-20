@@ -1,0 +1,13 @@
+use rx::core::*;
+
+fn update(values: Vec<&mut i32>, mut s: &i32) {
+    s = values[0];
+}
+
+fn main() {
+    let mut value = 1;
+    let version = 2;
+    let mut values = Vec::<&mut i32>::new();
+    values.push(&mut value);
+    update(values, &version);
+}
