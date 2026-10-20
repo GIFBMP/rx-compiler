@@ -6,6 +6,7 @@
 #include "../AST/type.h"
 #include "constEval.h"
 #include "scope.h"
+#include "sema_result.h"
 #include "semtype.h"
 #include "symbol.h"
 #include <memory>
@@ -26,14 +27,6 @@ struct PlaceInfo {
     bool gated = false;//reached through a shared reference or an immutably-accessed Vec index
 };
 
-struct FuncSig {
-    std::vector<SemTypePtr> params;
-    SemTypePtr ret;
-    bool hasSelf = false;
-    bool selfByRef = false;
-    bool selfMut = false;
-};
-
 enum class ContainerArg { T, Usize };
 
 enum class ContainerRet { T, BoxT, VecT, Usize, Bool, Unit };
@@ -44,21 +37,7 @@ struct ContainerMember {
     bool selfMut = false;
     std::vector<ContainerArg> params;
     ContainerRet ret = ContainerRet::Unit;
-};
-
-struct StructInfo {
-    const StructDefItem *def = nullptr;
-
-    struct Field {
-        std::string name;
-        SemTypePtr type;
-        SourceSpan span{};
-    };
-
-    std::vector<Field> fields;
-    std::unordered_map<std::string, std::size_t> fieldIndex;
-    std::unordered_map<std::string, Symbol *> members;
-    std::vector<Derive> derives;
+    BuiltinOp op = BuiltinOp::None;
 };
 
 struct LoopCtx {
@@ -81,6 +60,7 @@ public:
 
     const std::unordered_map<std::string, Symbol *> &typeTable() const;
     const std::unordered_map<std::string, Symbol *> &globalTable() const;
+    const SemaResult &semaResult() const;
 
     friend class ConstEvaluator;
 
@@ -120,7 +100,8 @@ private:
     SemTypePtr checkPathType(PathType *type);
 
     void addType(const std::string &name, const SemTypePtr &type);
-    void addFn(const std::string &name, const std::vector<SemTypePtr> &params, const SemTypePtr &ret);
+    void addFn(const std::string &name, const std::vector<SemTypePtr> &params, const SemTypePtr &ret,
+               BuiltinOp op = BuiltinOp::None);
 
     Symbol *declareType(std::unique_ptr<Symbol> sym);
     Symbol *declareValue(std::unique_ptr<Symbol> sym);
@@ -131,6 +112,7 @@ private:
     SemTypePtr checkStmt(Stmt *stmt, Scope &scope);
     void checkImpl(ImplItem *item);
     SemTypePtr checkExpr(Expr *expr, Scope &scope, const SemTypePtr &expected = nullptr);
+    SemTypePtr checkExprNode(Expr *expr, Scope &scope, const SemTypePtr &expected);
     PlaceInfo placeInfo(Expr *expr, Scope &scope);
     SemTypePtr placeTypeOf(Expr *expr, Scope &scope);
 
@@ -174,12 +156,10 @@ private:
 
     std::unordered_map<std::string, Symbol *> types;
     std::unordered_map<std::string, Symbol *> globals;
-    std::unordered_map<const StructDefItem *, StructInfo> structs;
     std::unordered_map<const ImplItem *, const StructDefItem *> implTargets;
-    std::unordered_map<const Symbol *, ConstValue> constValues;
-    std::unordered_map<const Symbol *, FuncSig> sigs;
     std::unordered_map<std::string, std::unordered_map<std::string, ContainerMember>> containerMembers;
-    std::vector<std::unique_ptr<Symbol>> ownedSymbols;
+
+    SemaResult result;
 
     ConstEvaluator constEval;
     const StructDefItem *currentImplSelf = nullptr;
