@@ -945,7 +945,7 @@ void SemanticAnalyzer::checkFunc(FuncDefItem *item) {
             }
             pos++;
         }
-        scope.define(std::move(sym));
+        result.resolved[param] = scope.define(std::move(sym));
     }
 
     if(item->body == nullptr) return;
@@ -1009,7 +1009,7 @@ SemTypePtr SemanticAnalyzer::checkStmt(Stmt *stmt, Scope &scope) {
             sym->isPlace = true;
             sym->type = assignType ? assignType
                                    : (initType ? initType : SemType::makeError());
-            scope.define(std::move(sym));
+            result.resolved[st] = scope.define(std::move(sym));
             return SemType::makeUnit();
         }
         case NodeType::ExprStmt: {

@@ -13,6 +13,8 @@ add_executable(rxc
     src/AST/AstBuilder.cpp
     src/semantic/analyzer.cpp
     src/semantic/constEval.cpp
+    src/IR/lower.cpp
+    src/IR/LLVMEmit.cpp
 )
 
 target_include_directories(rxc PRIVATE src)
