@@ -3,6 +3,7 @@
 #include "../semantic/analyzer.h"
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 class Lower {
 public:
@@ -19,6 +20,11 @@ private:
 
     bool curFuncIsMain = false;
     SemTypePtr curFuncRet = nullptr;
+    bool curAggRet = false;
+    IRValue curSret;
+
+    IRGlobal *IntFmt = nullptr;//"%d\0"
+    IRGlobal *IntlnFmt = nullptr;//"%d\n\0"
 
     std::unordered_map<const Symbol*, IRValue> locals;//local symbols/params;
     std::unordered_map<const StructDefItem*, IRStruct*> structs;
@@ -30,6 +36,18 @@ private:
     IRValue newReg(IRType *t);
     size_t newBlock(const std::string &name);
     void emit(const IRInstr &instr);
+    void emitUnreachable();
+    void emitRet();
+    void emitRet(IRValue value);
+    void emitSretReturn(IRValue sret, IRValue value, IRType *type);
+    IRValue emitAlloca(IRType *type);
+    IRValue emitLoad(IRType *type, IRValue ptr);
+    void emitStore(IRValue value, IRValue ptr, IRType *type);
+    void emitMemcpy(IRValue dst, IRValue src, size_t size);
+    void emitMemcpy(IRValue dst, IRValue src, IRValue size);
+    void emitMemmove(IRValue dst, IRValue src, IRValue size);
+    IRValue emitCall(const std::string &calleeName, IRType *retType,
+                     const std::vector<IRValue> &args, bool varArg = false);
 
     bool terminated() const;
     const Symbol *declSymbol(const AstNode *node) const;
@@ -73,5 +91,11 @@ private:
     IRValue lowerUnitExpr(UnitExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerGroupExpr(GroupExpr *expr, const SemTypePtr &expected = nullptr);
 
+    IRValue lowerBuiltinIO(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op);
+    IRValue lowerBuiltinFunc(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op);
+    IRValue lowerFuncCall(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+
     IRValue coerce(IRValue val, const SemTypePtr &src, const SemTypePtr &dst);
+
+    IRGlobal *getFmtGlobal(const std::string &str, const std::string &name);
 };

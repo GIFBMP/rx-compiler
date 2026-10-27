@@ -184,7 +184,7 @@ enum class IROp {
     Add, Sub, Mul, SDiv, UDiv, SRem, URem,
     And, Or, Xor, Shl, LShr, AShr,
     ICmp, Zext, Trunc, Bitcast, PtrToInt, IntToPtr,
-    Call, Br, CondBr, Ret, Unreachable, Memcpy,
+    Call, Br, CondBr, Ret, Unreachable, Memcpy, Memmove,
 };
 
 enum class IRCmp {
@@ -207,7 +207,6 @@ struct IRInstr {
     size_t thenBrBlock = 0;//br
     size_t elseBrBlock = 0;//cond br
 
-    IRFunc *callee = nullptr;//call
     std::string calleeName;
     bool varArg = false;
     size_t align = 0;

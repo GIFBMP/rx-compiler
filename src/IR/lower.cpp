@@ -1,8 +1,17 @@
 #include "lower.h"
+#include "semantic/symbol.h"
 
 #include <utility>
 
+static bool isAggregateType(const IRType *type) {
+    return type != nullptr &&
+           (type->kind == IRKind::Struct || type->kind == IRKind::Array);
+}
+
 IRModule Lower::lower(Crate *crate) {
+    IntFmt = getFmtGlobal("%d", ".fmt_int");
+    IntlnFmt = getFmtGlobal("%d\n", ".fmt_int_nl");
+
     declSyms.clear();
     for(auto &it: sema.sigs) {
         const auto *sym = it.first;
@@ -123,6 +132,97 @@ void Lower::emit(const IRInstr &instr) {
     assert(curBlock < curFunc->blocks.size());
     assert(!terminated());
     curFunc->blocks[curBlock]->instrs.push_back(std::make_unique<IRInstr>(instr));
+}
+
+void Lower::emitUnreachable() {
+    IRInstr unr;
+    unr.op = IROp::Unreachable;
+    emit(unr);
+}
+
+void Lower::emitRet() {
+    IRInstr instr;
+    instr.op = IROp::Ret;
+    instr.type = types.voidType();
+    emit(instr);
+}
+
+void Lower::emitRet(IRValue value) {
+    assert(value.type != nullptr);
+    assert(!isAggregateType(value.type));
+
+    IRInstr instr;
+    instr.op = IROp::Ret;
+    instr.type = value.type;
+    instr.args.push_back(value);
+    emit(instr);
+}
+
+void Lower::emitSretReturn(IRValue sret, IRValue value, IRType *type) {
+    assert(type != nullptr);
+    assert(isAggregateType(type));
+
+    emitMemcpy(sret, value, type->size);
+    emitRet();
+}
+
+IRValue Lower::emitAlloca(IRType *type) {
+    assert(type != nullptr);
+    IRValue slot = newReg(types.ptr());
+    IRInstr instr;
+    instr.op = IROp::Alloca;
+    instr.type = type;
+    instr.dst = slot;
+    instr.hasDst = true;
+    instr.align = type->align;
+    emit(instr);
+    return slot;
+}
+
+IRValue Lower::emitLoad(IRType *type, IRValue ptr) {
+    assert(type != nullptr);
+    IRValue dst = newReg(type);
+    IRInstr instr;
+    instr.op = IROp::Load;
+    instr.type = type;
+    instr.dst = dst;
+    instr.hasDst = true;
+    instr.args.push_back(ptr);
+    emit(instr);
+    return dst;
+}
+
+void Lower::emitStore(IRValue value, IRValue ptr, IRType *type) {
+    assert(type != nullptr);
+    IRInstr instr;
+    instr.op = IROp::Store;
+    instr.type = type;
+    instr.args.push_back(value);
+    instr.args.push_back(ptr);
+    emit(instr);
+}
+
+void Lower::emitMemcpy(IRValue dst, IRValue src, IRValue size) {
+    IRInstr copy;
+    copy.op = IROp::Memcpy;
+    copy.args.push_back(dst);
+    copy.args.push_back(src);
+    copy.args.push_back(size);
+    emit(copy);
+}
+
+void Lower::emitMemcpy(IRValue dst, IRValue src, size_t size) {
+    emitMemcpy(dst, src, IRValue{IRValueKind::Int, types.i32(), 0,
+                                 static_cast<long long>(size), nullptr});
+}
+
+void Lower::emitMemmove(IRValue dst, IRValue src, IRValue size) {
+    IRInstr move;
+    move.op = IROp::Memmove;
+    move.args.push_back(dst);
+    move.args.push_back(src);
+    move.args.push_back(size);
+    emit(move);
 }
 
 bool Lower::terminated() const {
@@ -318,14 +418,7 @@ void Lower::preDeclareLet(LetStmt *stmt) {
     IRType *ty = irType(sym->type);
     if(ty == nullptr || ty->kind == IRKind::Void) return;
 
-    IRValue slot = newReg(types.ptr());
-    IRInstr alloc;
-    alloc.op = IROp::Alloca;
-    alloc.type = ty;
-    alloc.dst = slot;
-    alloc.hasDst = true;
-    alloc.align = ty->align;
-    emit(alloc);
+    IRValue slot = emitAlloca(ty);
 
     locals[sym] = slot;
 }
@@ -341,9 +434,12 @@ void Lower::lowerFunc(FuncDefItem *item) {
     auto *owner = memberOwner(sym);//impl case
     bool isMain = (owner == nullptr && item->name == "main");
 
+    IRType *retTy = irType(sig.ret);
+    bool aggRet = isAggregateType(retTy);
+
     auto func = std::make_unique<IRFunc>();
     func->name = owner ? owner->name + "." + item->name : item->name;
-    func->retType = isMain ? types.i32() : irType(sig.ret);
+    func->retType = isMain ? types.i32() : (aggRet ? types.voidType() : retTy);
 
     module.funcs.push_back(std::move(func));
     curFunc = module.funcs.back().get();
@@ -353,33 +449,36 @@ void Lower::lowerFunc(FuncDefItem *item) {
     locals.clear();
     curFuncRet = sig.ret;
     curFuncIsMain = isMain;//re-initialize
+    curAggRet = aggRet;
+    curSret = {};
     curBlock = newBlock("entry");
+
+    if(aggRet) {
+        curSret = newReg(types.ptr());
+        curFunc->params.push_back(curSret);//sret, %out+memcpy+ret void
+    }
 
     for(auto &p: item->params) {//allocate params
         auto *paramSym = sema.symbolOf(p.get());
         assert(paramSym != nullptr);
-        auto *paramType = irType(paramSym->type);
-        assert(paramType->kind != IRKind::Void);
+        IRType *storageType = irType(paramSym->type);
+        assert(storageType->kind != IRKind::Void);
+
+        bool byPtr = isAggregateType(storageType);
+        IRType *paramType = byPtr ? types.ptr() : storageType;
 
         auto reg = newReg(paramType);//imm reg, just for store
         curFunc->params.push_back(reg);
 
-        auto stackSlot = newReg(types.ptr());
-        IRInstr alloc;
-        alloc.op = IROp::Alloca;
-        alloc.type = paramType;
-        alloc.dst = stackSlot;
-        alloc.hasDst = true;
-        alloc.align = paramType->align;
-        emit(alloc);
+        auto stackSlot = emitAlloca(storageType);
         locals[paramSym] = stackSlot;//alloca
 
-        IRInstr store;
-        store.op = IROp::Store;
-        store.type = paramType;
-        store.args.push_back(reg);
-        store.args.push_back(stackSlot);
-        emit(store);//store
+        if(byPtr) {
+            emitMemcpy(stackSlot, reg, storageType->size);
+        }
+        else {
+            emitStore(reg, stackSlot, storageType);//store
+        }
     }
 
     //preprocess the letstmt(entry alloca, according to standard llvm)
@@ -391,38 +490,27 @@ void Lower::lowerFunc(FuncDefItem *item) {
     if(item->body) {
         SemTypePtr bodyType = sema.typeOf(item->body.get());
         if(bodyType && bodyType->isNever()) {
-            IRInstr unr;
-            unr.op = IROp::Unreachable;
-            emit(unr);
+            emitUnreachable();
             return;
         }
     }
 
     if(isMain) {//ret i32 0
-        IRInstr ret;
-        ret.op = IROp::Ret;
-        ret.type = types.i32();
-        ret.args.push_back(IRValue{IRValueKind::Int, types.i32(), 0, 0, nullptr});
-        emit(ret);
+        emitRet(IRValue{IRValueKind::Int, types.i32(), 0, 0, nullptr});
+    }
+    else if(aggRet) {
+        emitSretReturn(curSret, tail, retTy);
     }
     else if(!sig.ret || sig.ret->kind == SemKind::Unit) {
-        IRInstr ret;
-        ret.op = IROp::Ret;
-        ret.type = types.voidType();
-        emit(ret);
+        emitRet();
     }
     else {
-        IRInstr ret;
-        ret.op = IROp::Ret;
-        ret.type = irType(sig.ret);
         IRValue val = coerce(tail, item->body->tail ? sema.typeOf(item->body->tail.get()) : nullptr, sig.ret);
-        ret.args.push_back(val);
-        emit(ret);
+        emitRet(val);
     }
 }
 
 bool Lower::lowerLetStmt(LetStmt *stmt) {
-
     auto *sym = sema.symbolOf(stmt);
     if(sym == nullptr) return terminated();
     
@@ -438,13 +526,12 @@ bool Lower::lowerLetStmt(LetStmt *stmt) {
     val = coerce(val, sema.typeOf(stmt->init.get()), sym->type);
     auto slot = it->second;
 
-    IRInstr store;
-    store.op = IROp::Store;
-    store.type = typ;
-    store.args.push_back(val);
-    store.args.push_back(slot);
-    emit(store);
-
+    if(isAggregateType(typ)) {
+        emitMemcpy(slot, val, typ->size);
+    }
+    else {
+        emitStore(val, slot, typ);
+    }
     return terminated();
 }
 
@@ -506,27 +593,86 @@ IRValue Lower::lowerExpr(Expr *expr, const SemTypePtr &expected) {
 }
 
 IRValue Lower::lowerBoolExpr(BoolExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
+    //imm number, does not need reg
     (void)expected;
-    return {};
+    IRValue ret;
+    ret.kind = IRValueKind::Int;
+    ret.type = types.i1();
+    ret.intValue = expr->val ? 1 : 0;
+    return ret;
 }
 
 IRValue Lower::lowerIntExpr(IntExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
+    //imm number, does not need reg
     (void)expected;
-    return {};
+    IRValue ret;
+    ret.kind = IRValueKind::Int;
+    ret.type = types.i32();
+    ret.intValue = static_cast<long long>(expr->val.val);
+    return ret;
 }
 
 IRValue Lower::lowerBlockExpr(BlockExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
-    (void)expected;
+    if(!expr) {
+        return {};
+    }
+    for(auto &stmt: expr->statements) {
+        if(lowerStmt(stmt.get())) {
+            return {};//terminated
+        }
+    }
+    if(expr->tail && !terminated()) {
+        return lowerExpr(expr->tail.get(), expected);
+    }
     return {};
 }
 
 IRValue Lower::lowerPathExpr(PathExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+    auto *sym = sema.symbolOf(expr);
+    if(sym == nullptr) return {};
+
+    switch(sym->kind) {
+        case SymbolKind::Local:
+        case SymbolKind::Param: {
+            auto it = locals.find(sym);
+            if(it == locals.end()) return {};
+            auto *typ = irType(sym->type);
+            if(typ == nullptr || typ->kind == IRKind::Void) return {};
+
+            if(typ->kind == IRKind::Struct || typ->kind == IRKind::Array) {
+                //aggregate types
+                return it->second;
+            }
+            else {
+                return emitLoad(typ, it->second);
+            }
+        }
+        case SymbolKind::Const:
+        case SymbolKind::AssocConst: {
+            auto it = sema.constValues.find(sym);
+            if(it == sema.constValues.end()) return {};
+
+            auto constVal = it->second;
+            auto typ = sema.typeOf(expr);
+            if(!typ) typ = sym->type;
+
+            IRValue val;
+            val.kind = IRValueKind::Int;
+            val.type = irType(typ);
+            if(constVal.isInt()) {
+                val.intValue = static_cast<long long>(constVal.val.val);
+            }
+            else {
+                val.intValue = constVal.boolVal ? 1 : 0;
+            }
+            return val;
+        }
+        default: {//fn: not a value
+            assert(false);
+            return {};
+        }
+    }
 }
 
 IRValue Lower::lowerUnaryExpr(UnaryExpr *expr, const SemTypePtr &expected) {
@@ -554,8 +700,47 @@ IRValue Lower::lowerFieldExpr(FieldExpr *expr, const SemTypePtr &expected) {
 }
 
 IRValue Lower::lowerReturnExpr(ReturnExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
+    if(curFuncIsMain) {
+        if(expr->val) {
+            auto v = lowerExpr(expr->val.get(), curFuncRet);
+            (void)v;
+            if(terminated()) return {};
+        }
+        emitRet(IRValue{IRValueKind::Int, types.i32(), 0, 0, nullptr});
+        return {};
+    }
+
+    if(curAggRet) {
+        if(!expr->val) {
+            assert(false);
+            return {};
+        }
+        IRValue val = lowerExpr(expr->val.get(), curFuncRet);
+        if(terminated()) return {};
+        val = coerce(val, sema.typeOf(expr->val.get()), curFuncRet);
+        emitSretReturn(curSret, val, irType(curFuncRet));
+        return {};
+    }
+
+    if(!curFuncRet || curFuncRet->kind == SemKind::Unit) {
+        if(expr->val) {
+            auto v = lowerExpr(expr->val.get(), curFuncRet);
+            (void)v;
+            if(terminated()) return {};
+        }
+        emitRet();
+        return {};
+    }
+
+    if(!expr->val) {
+        assert(false);
+        return {};
+    }
+    IRValue val = lowerExpr(expr->val.get(), curFuncRet);
+    if(terminated()) return {};
+    val = coerce(val, sema.typeOf(expr->val.get()), curFuncRet);
+    emitRet(val);
     return {};
 }
 
@@ -607,10 +792,162 @@ IRValue Lower::lowerIndexExpr(IndexExpr *expr, const SemTypePtr &expected) {
     return {};
 }
 
-IRValue Lower::lowerCallExpr(CallExpr *expr, const SemTypePtr &expected) {
+IRValue Lower::lowerBuiltinIO(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op) {
+    (void)callee;
+    switch(op) {
+        case BuiltinOp::PrintI32: {
+            IRInstr call;
+            call.op = IROp::Call;
+            call.type = types.i32();
+            call.varArg = true;
+            call.hasDst = false;
+            call.calleeName = "printf";
+            IRValue fmtVal;
+            fmtVal.kind = IRValueKind::Global;
+            fmtVal.type = types.ptr();
+            fmtVal.global = IntFmt;
+            call.args.push_back(fmtVal);
+
+            auto val = lowerExpr(expr->args[0].get(), sig.params[0]);
+            if(terminated()) return {};
+            val = coerce(val, sema.typeOf(expr->args[0].get()), sig.params[0]);
+            call.args.push_back(val);
+            
+            emit(call);
+            return {};
+        }
+        case BuiltinOp::GetI32: {
+            auto tmp = emitAlloca(types.i32());
+            IRInstr call;
+            call.op = IROp::Call;
+            call.type = types.i32();
+            call.calleeName = "scanf";
+            call.varArg = true;
+            call.hasDst = false;
+            IRValue fmtVal;
+            fmtVal.kind = IRValueKind::Global;
+            fmtVal.type = types.ptr();
+            fmtVal.global = IntFmt;
+            call.args.push_back(fmtVal);
+            call.args.push_back(tmp);
+            emit(call);
+            return emitLoad(types.i32(), tmp);
+        }
+        case BuiltinOp::PrintlnI32: {
+            IRInstr call;
+            call.op = IROp::Call;
+            call.type = types.i32();
+            call.varArg = true;
+            call.hasDst = false;
+            call.calleeName = "printf";
+            IRValue fmtVal;
+            fmtVal.kind = IRValueKind::Global;
+            fmtVal.type = types.ptr();
+            fmtVal.global = IntlnFmt;
+            call.args.push_back(fmtVal);
+
+            auto val = lowerExpr(expr->args[0].get(), sig.params[0]);
+            if(terminated()) return {};
+            val = coerce(val, sema.typeOf(expr->args[0].get()), sig.params[0]);
+            call.args.push_back(val);
+            
+            emit(call);
+            return {};
+        }
+        default: return {};
+    }
+}
+
+IRValue Lower::emitCall(const std::string &calleeName, IRType *retType,
+                        const std::vector<IRValue> &args, bool varArg) {
+    IRInstr call;
+    call.op = IROp::Call;
+    call.calleeName = calleeName;
+    call.varArg = varArg;
+
+    bool isAggregate = isAggregateType(retType);
+    call.type = isAggregate ? types.voidType() : retType;
+
+    IRValue out;
+    if(isAggregate) {
+        out = emitAlloca(retType);
+        call.args.push_back(out);
+    }
+    else if(retType->kind != IRKind::Void) {
+        call.dst = newReg(retType);
+        call.hasDst = true;
+    }
+
+    call.args.insert(call.args.end(), args.begin(), args.end());
+    emit(call);
+    return isAggregate ? out : (call.hasDst ? call.dst : IRValue{});
+}
+
+IRValue Lower::lowerFuncCall(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    const StructDefItem *owner = memberOwner(callee);
+    std::string calleeName = owner ? owner->name + "." + callee->name : callee->name;
+
+    std::vector<IRValue> args;
+    args.reserve(sig.params.size() + (sig.hasSelf ? 1 : 0));
+    size_t base = sig.hasSelf ? 1 : 0;
+
+    if(sig.hasSelf) {
+        if(expr->args.empty()) return {};
+        auto recvType = sig.selfByRef ? SemType::makeRef(callee->type, sig.selfMut) : callee->type;
+        auto val = lowerExpr(expr->args[0].get(), recvType);
+        if(terminated()) return {};
+        val = coerce(val, sema.typeOf(expr->args[0].get()), recvType);
+        args.push_back(val);
+    }
+
+    for(size_t i = 0; i < sig.params.size(); i++) {
+        auto *argExpr = expr->args[i + base].get();
+        auto val = lowerExpr(argExpr, sig.params[i]);
+        if(terminated()) return {};
+        val = coerce(val, sema.typeOf(argExpr), sig.params[i]);
+        args.push_back(val);
+    }
+
+    return emitCall(calleeName, irType(sig.ret), args, false);
+}
+
+IRValue Lower::lowerBuiltinFunc(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op) {
     (void)expr;
-    (void)expected;
+    (void)callee;
+    (void)sig;
+    (void)op;
     return {};
+}
+
+IRValue Lower::lowerCallExpr(CallExpr *expr, const SemTypePtr &expected) {
+    (void)expected;
+    auto sym = sema.symbolOf(expr->callee.get());
+    if(sym == nullptr) return {};
+    auto sigIt = sema.sigs.find(sym);
+    if(sigIt == sema.sigs.end()) return {};
+
+    auto &sig = sigIt->second;
+
+    auto op = sema.builtinOpOf(sym);
+
+    if(op == BuiltinOp::PrintI32 || op == BuiltinOp::PrintlnI32 || op == BuiltinOp::GetI32) {
+        return lowerBuiltinIO(expr, sym, sig, op);
+    }
+    else if(op != BuiltinOp::None) {
+        return lowerBuiltinFunc(expr, sym, sig, op);
+    }
+
+    if(sym->name == "main" && memberOwner(sym) == nullptr) {//main;
+        IRInstr call;
+        call.op = IROp::Call;
+        call.calleeName = "main";
+        call.type = types.i32();
+        call.hasDst = false;
+        emit(call);
+        return {};//Unit
+    }
+
+    return lowerFuncCall(expr, sym, sig);
 }
 
 IRValue Lower::lowerMethodCallExpr(MethodCallExpr *expr, const SemTypePtr &expected) {
@@ -628,17 +965,54 @@ IRValue Lower::lowerCastExpr(CastExpr *expr, const SemTypePtr &expected) {
 IRValue Lower::lowerUnitExpr(UnitExpr *expr, const SemTypePtr &expected) {
     (void)expr;
     (void)expected;
-    return {};
+    return {};//Unit is invalid SSA type
 }
 
 IRValue Lower::lowerGroupExpr(GroupExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
-    (void)expected;
-    return {};
+    return lowerExpr(expr->inner.get(), expected);
 }
 
 IRValue Lower::coerce(IRValue val, const SemTypePtr &src, const SemTypePtr &dst) {
-    (void)src;
-    (void)dst;
+    if(!src || !dst) return val;
+    if(src->isError() || dst->isError()) return val;
+    if(src->isNever()) return {};
+    if(sameType(src, dst)) return val;
+
+    //unit->other: already rejected in semantic
+    //not ref coerce: already rejected in semantic
+    //not mut->mut: already rejected in semantic
+
+    assert(src->kind == SemKind::Ref && dst->kind == SemKind::Ref);
+    assert(src->inner != nullptr && dst->inner != nullptr);
+    assert(!(dst->isMut && !src->isMut));
+
+    auto cur = src->inner;
+    while(cur) {
+        if(sameType(cur, dst->inner)) {
+            return val;
+        }
+        //cur not box or not ref: already rejected in semantic
+        if(cur->kind != SemKind::Ref && cur->kind != SemKind::Box) break;
+        //not mut->mut: already rejected in semantic
+        if(dst->isMut && cur->kind == SemKind::Ref && !cur->isMut) break;
+
+        IRValue x = emitLoad(types.ptr(), val);
+        val = x;
+        cur = cur->inner;
+    }
+    assert(false);
     return val;
+}
+
+IRGlobal *Lower::getFmtGlobal(const std::string &str, const std::string &name) {
+    auto global = std::make_unique<IRGlobal>();
+    global->name = name;
+    global->bytes.assign(str.begin(), str.end());
+    global->bytes.push_back(0);//add the end '\0'
+    global->type = types.array(types.i8(), global->bytes.size());
+    global->align = 1;
+
+    auto *raw = global.get();
+    module.globals.push_back(std::move(global));
+    return raw;
 }
