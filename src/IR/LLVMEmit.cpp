@@ -50,6 +50,96 @@ std::string blockLabel(size_t index) {
     return index == 0 ? "entry" : "bb" + std::to_string(index);
 }
 
+const char *binaryOpName(IROp op) {
+    switch(op) {
+        case IROp::Add:  return "add";
+        case IROp::Sub:  return "sub";
+        case IROp::Mul:  return "mul";
+        case IROp::SDiv: return "sdiv";
+        case IROp::UDiv: return "udiv";
+        case IROp::SRem: return "srem";
+        case IROp::URem: return "urem";
+        case IROp::And:  return "and";
+        case IROp::Or:   return "or";
+        case IROp::Xor:  return "xor";
+        case IROp::Shl:  return "shl";
+        case IROp::LShr: return "lshr";
+        case IROp::AShr: return "ashr";
+        default: return nullptr;
+    }
+}
+
+const char *icmpPredicate(IRCmp cmp) {
+    switch(cmp) {
+        case IRCmp::Eq:  return "eq";
+        case IRCmp::Ne:  return "ne";
+        case IRCmp::Ugt: return "ugt";
+        case IRCmp::Uge: return "uge";
+        case IRCmp::Ult: return "ult";
+        case IRCmp::Ule: return "ule";
+        case IRCmp::Sgt: return "sgt";
+        case IRCmp::Sge: return "sge";
+        case IRCmp::Slt: return "slt";
+        case IRCmp::Sle: return "sle";
+    }
+    return "eq";
+}
+
+void collectStructs(const IRType *type,
+                    std::set<const IRStruct *> &seen,
+                    std::vector<const IRStruct *> &out) {
+    if(type == nullptr) return;
+
+    if(type->kind == IRKind::Array) {
+        collectStructs(type->elem, seen, out);
+        return;
+    }
+    if(type->kind != IRKind::Struct || type->structInfo == nullptr) {
+        return;
+    }
+
+    const IRStruct *info = type->structInfo;
+    if(!seen.insert(info).second) return;
+
+    for(const auto &field : info->fields) {
+        collectStructs(field.type, seen, out);
+    }
+    out.push_back(info);
+}
+
+void collectStructs(const IRValue &value,
+                    std::set<const IRStruct *> &seen,
+                    std::vector<const IRStruct *> &out) {
+    collectStructs(value.type, seen, out);
+}
+
+std::vector<const IRStruct *> moduleStructs(const IRModule &module) {
+    std::set<const IRStruct *> seen;
+    std::vector<const IRStruct *> out;
+
+    for(const auto &global : module.globals) {
+        collectStructs(global->type, seen, out);
+    }
+
+    for(const auto &func : module.funcs) {
+        collectStructs(func->retType, seen, out);
+        for(const auto &param : func->params) {
+            collectStructs(param, seen, out);
+        }
+        for(const auto &block : func->blocks) {
+            for(const auto &instr : block->instrs) {
+                collectStructs(instr->type, seen, out);
+                collectStructs(instr->dst, seen, out);
+                for(const auto &arg : instr->args) {
+                    collectStructs(arg, seen, out);
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
 bool usesOp(const IRModule &module, IROp op) {
     for(const auto &func : module.funcs) {
         for(const auto &block : func->blocks) {
@@ -85,6 +175,17 @@ bool emitInstr(const IRInstr &instr, std::ostream &out) {
             out << "  unreachable\n";
             return true;
         }
+        case IROp::Br: {
+            out << "  br label %" << blockLabel(instr.thenBrBlock) << "\n";
+            return true;
+        }
+        case IROp::CondBr: {
+            if(instr.args.empty()) return false;
+            out << "  br i1 " << valueName(instr.args[0])
+                << ", label %" << blockLabel(instr.thenBrBlock)
+                << ", label %" << blockLabel(instr.elseBrBlock) << "\n";
+            return true;
+        }
         case IROp::Alloca: {
             out << "  " << valueName(instr.dst) << " = alloca "
                 << typeName(instr.type);
@@ -105,6 +206,52 @@ bool emitInstr(const IRInstr &instr, std::ostream &out) {
             if(instr.args.size() < 2) return false;
             out << "  store " << typeName(instr.args[0].type) << " "
                 << valueName(instr.args[0]) << ", ptr "
+                << valueName(instr.args[1]) << "\n";
+            return true;
+        }
+        case IROp::Gep: {
+            if(!instr.hasDst || instr.args.empty()) return false;
+
+            out << "  " << valueName(instr.dst) << " = getelementptr "
+                << typeName(instr.type) << ", ptr "
+                << valueName(instr.args[0]);
+            for(size_t i = 1; i < instr.args.size(); i++) {
+                out << ", " << typeName(instr.args[i].type) << " "
+                    << valueName(instr.args[i]);
+            }
+            out << "\n";
+            return true;
+        }
+        case IROp::Add:
+        case IROp::Sub:
+        case IROp::Mul:
+        case IROp::SDiv:
+        case IROp::UDiv:
+        case IROp::SRem:
+        case IROp::URem:
+        case IROp::And:
+        case IROp::Or:
+        case IROp::Xor:
+        case IROp::Shl:
+        case IROp::LShr:
+        case IROp::AShr: {
+            if(!instr.hasDst || instr.args.size() < 2) return false;
+            const char *opName = binaryOpName(instr.op);
+            if(opName == nullptr) return false;
+
+            out << "  " << valueName(instr.dst) << " = " << opName << " "
+                << typeName(instr.type) << " "
+                << valueName(instr.args[0]) << ", "
+                << valueName(instr.args[1]) << "\n";
+            return true;
+        }
+        case IROp::ICmp: {
+            if(!instr.hasDst || instr.args.size() < 2) return false;
+
+            out << "  " << valueName(instr.dst) << " = icmp "
+                << icmpPredicate(instr.cmp) << " "
+                << typeName(instr.args[0].type) << " "
+                << valueName(instr.args[0]) << ", "
                 << valueName(instr.args[1]) << "\n";
             return true;
         }
@@ -204,6 +351,15 @@ std::vector<std::string> externalDecls(const IRModule &module) {
 
 bool LLVMEmit::emit(const IRModule &module, std::ostream &out) {
     out << "target triple = \"riscv32-unknown-none-elf\"\n";
+
+    for(const auto *info : moduleStructs(module)) {
+        out << "%struct." << info->name << " = type { ";
+        for(size_t i = 0; i < info->fields.size(); i++) {
+            if(i != 0) out << ", ";
+            out << typeName(info->fields[i].type);
+        }
+        out << " }\n";
+    }
 
     for(const auto &global : module.globals) {
         out << "@" << global->name << " = private unnamed_addr constant "

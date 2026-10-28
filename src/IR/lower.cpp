@@ -1,6 +1,7 @@
 #include "lower.h"
 #include "semantic/symbol.h"
 
+#include <sstream>
 #include <utility>
 
 static bool isAggregateType(const IRType *type) {
@@ -8,7 +9,20 @@ static bool isAggregateType(const IRType *type) {
            (type->kind == IRKind::Struct || type->kind == IRKind::Array);
 }
 
+static bool isICmpOperandType(const IRType *type) {
+    return type != nullptr &&
+           (type->kind == IRKind::I1 ||
+            type->kind == IRKind::I8 ||
+            type->kind == IRKind::I32 ||
+            type->kind == IRKind::Ptr);
+}
+
 IRModule Lower::lower(Crate *crate) {
+    eqHelperNames.clear();
+    pendingEqTypes.clear();
+    eqHelperCounter = 0;
+    ctxStack.clear();
+
     IntFmt = getFmtGlobal("%d", ".fmt_int");
     IntlnFmt = getFmtGlobal("%d\n", ".fmt_int_nl");
 
@@ -47,6 +61,8 @@ IRModule Lower::lower(Crate *crate) {
             default: break;
         }
     }
+
+    generateEqHelpers();
     return std::move(module);
 }
 
@@ -118,6 +134,19 @@ IRValue Lower::newReg(IRType *t) {
     return ret;
 }
 
+IRValue Lower::makeIRInt(long long value, IRType *type) {
+    if(type == nullptr) {
+        type = types.i32();
+    }
+    assert(type != nullptr);
+
+    IRValue ret;
+    ret.kind = IRValueKind::Int;
+    ret.type = type;
+    ret.intValue = value;
+    return ret;
+}
+
 size_t Lower::newBlock(const std::string &name) {
     assert(curFunc != nullptr);
     size_t id = curFunc->blocks.size();
@@ -127,11 +156,34 @@ size_t Lower::newBlock(const std::string &name) {
     return id;
 }
 
+void Lower::switchBlock(size_t block) {
+    assert(curFunc != nullptr);
+    assert(block < curFunc->blocks.size());
+    curBlock = block;
+}
+
 void Lower::emit(const IRInstr &instr) {
     assert(curFunc != nullptr);
     assert(curBlock < curFunc->blocks.size());
     assert(!terminated());
     curFunc->blocks[curBlock]->instrs.push_back(std::make_unique<IRInstr>(instr));
+}
+
+void Lower::emitBr(size_t target) {
+    IRInstr instr;
+    instr.op = IROp::Br;
+    instr.thenBrBlock = target;
+    emit(instr);
+}
+
+void Lower::emitCondBr(IRValue cond, size_t thenBlock, size_t elseBlock) {
+    IRInstr instr;
+    instr.op = IROp::CondBr;
+    instr.type = types.i1();
+    instr.args.push_back(cond);
+    instr.thenBrBlock = thenBlock;
+    instr.elseBrBlock = elseBlock;
+    emit(instr);
 }
 
 void Lower::emitUnreachable() {
@@ -168,6 +220,10 @@ void Lower::emitSretReturn(IRValue sret, IRValue value, IRType *type) {
 
 IRValue Lower::emitAlloca(IRType *type) {
     assert(type != nullptr);
+    assert(curFunc != nullptr);
+    assert(!curFunc->blocks.empty());
+    assert(type->kind != IRKind::Void);
+
     IRValue slot = newReg(types.ptr());
     IRInstr instr;
     instr.op = IROp::Alloca;
@@ -175,7 +231,22 @@ IRValue Lower::emitAlloca(IRType *type) {
     instr.dst = slot;
     instr.hasDst = true;
     instr.align = type->align;
-    emit(instr);
+
+    auto &entry = curFunc->blocks.front()->instrs;
+    size_t pos = entry.size();
+    if(pos != 0) {
+        switch(entry.back()->op) {
+            case IROp::Ret:
+            case IROp::Br:
+            case IROp::CondBr:
+            case IROp::Unreachable: {
+                pos--;
+                break;
+            }
+            default: break;
+        }
+    }
+    entry.insert(entry.begin() + pos, std::make_unique<IRInstr>(instr));
     return slot;
 }
 
@@ -202,6 +273,86 @@ void Lower::emitStore(IRValue value, IRValue ptr, IRType *type) {
     emit(instr);
 }
 
+IRValue Lower::emitGep(IRType *baseType, IRValue ptr,
+                       const std::vector<IRValue> &indices) {
+    assert(baseType != nullptr);
+    assert(ptr.type != nullptr);
+
+    IRValue dst = newReg(types.ptr());
+    IRInstr instr;
+    instr.op = IROp::Gep;
+    instr.type = baseType;
+    instr.dst = dst;
+    instr.hasDst = true;
+    instr.args.push_back(ptr);
+
+    for(const auto &index : indices) {
+        assert(index.type != nullptr);
+        assert(index.type->kind == IRKind::I8 ||
+               index.type->kind == IRKind::I32);
+        instr.args.push_back(index);
+    }
+
+    emit(instr);
+    return dst;
+}
+
+IRValue Lower::emitICmp(IRCmp cmp, IRValue lhs, IRValue rhs) {
+    assert(lhs.type != nullptr);
+    assert(rhs.type != nullptr);
+    assert(lhs.type == rhs.type);
+    assert(isICmpOperandType(lhs.type));
+
+    IRInstr instr;
+    instr.op = IROp::ICmp;
+    instr.type = types.i1();
+    instr.dst = newReg(types.i1());
+    instr.hasDst = true;
+    instr.cmp = cmp;
+    instr.args.push_back(lhs);
+    instr.args.push_back(rhs);
+    emit(instr);
+    return instr.dst;
+}
+
+IRValue Lower::emitBinaryOp(IROp op, IRValue lhs, IRValue rhs) {
+    switch(op) {
+        case IROp::Add:
+        case IROp::Sub:
+        case IROp::Mul:
+        case IROp::SDiv:
+        case IROp::UDiv:
+        case IROp::SRem:
+        case IROp::URem:
+        case IROp::And:
+        case IROp::Or:
+        case IROp::Xor:
+        case IROp::Shl:
+        case IROp::LShr:
+        case IROp::AShr: {
+            break;
+        }
+        default: {
+            assert(false);
+            return {};
+        }
+    }
+
+    assert(lhs.type != nullptr);
+    assert(rhs.type != nullptr);
+    assert(lhs.type == rhs.type);
+
+    IRInstr instr;
+    instr.op = op;
+    instr.type = lhs.type;
+    instr.dst = newReg(lhs.type);
+    instr.hasDst = true;
+    instr.args.push_back(lhs);
+    instr.args.push_back(rhs);
+    emit(instr);
+    return instr.dst;
+}
+
 void Lower::emitMemcpy(IRValue dst, IRValue src, IRValue size) {
     IRInstr copy;
     copy.op = IROp::Memcpy;
@@ -212,8 +363,7 @@ void Lower::emitMemcpy(IRValue dst, IRValue src, IRValue size) {
 }
 
 void Lower::emitMemcpy(IRValue dst, IRValue src, size_t size) {
-    emitMemcpy(dst, src, IRValue{IRValueKind::Int, types.i32(), 0,
-                                 static_cast<long long>(size), nullptr});
+    emitMemcpy(dst, src, makeIRInt(static_cast<long long>(size)));
 }
 
 void Lower::emitMemmove(IRValue dst, IRValue src, IRValue size) {
@@ -496,7 +646,7 @@ void Lower::lowerFunc(FuncDefItem *item) {
     }
 
     if(isMain) {//ret i32 0
-        emitRet(IRValue{IRValueKind::Int, types.i32(), 0, 0, nullptr});
+        emitRet(makeIRInt(0, types.i32()));
     }
     else if(aggRet) {
         emitSretReturn(curSret, tail, retTy);
@@ -595,21 +745,13 @@ IRValue Lower::lowerExpr(Expr *expr, const SemTypePtr &expected) {
 IRValue Lower::lowerBoolExpr(BoolExpr *expr, const SemTypePtr &expected) {
     //imm number, does not need reg
     (void)expected;
-    IRValue ret;
-    ret.kind = IRValueKind::Int;
-    ret.type = types.i1();
-    ret.intValue = expr->val ? 1 : 0;
-    return ret;
+    return makeIRInt(expr->val ? 1 : 0, types.i1());
 }
 
 IRValue Lower::lowerIntExpr(IntExpr *expr, const SemTypePtr &expected) {
     //imm number, does not need reg
     (void)expected;
-    IRValue ret;
-    ret.kind = IRValueKind::Int;
-    ret.type = types.i32();
-    ret.intValue = static_cast<long long>(expr->val.val);
-    return ret;
+    return makeIRInt(static_cast<long long>(expr->val.val));
 }
 
 IRValue Lower::lowerBlockExpr(BlockExpr *expr, const SemTypePtr &expected) {
@@ -675,15 +817,532 @@ IRValue Lower::lowerPathExpr(PathExpr *expr, const SemTypePtr &expected) {
     }
 }
 
+IRValue Lower::lowerPlace(Expr *expr) {
+    if(expr == nullptr) return {};
+
+    switch(expr->typ) {
+        case NodeType::GroupExpr: {
+            return lowerPlace(static_cast<GroupExpr*>(expr)->inner.get());
+        }
+        case NodeType::PathExpr: {
+            auto *sym = sema.symbolOf(expr);
+            if(sym == nullptr) return {};
+            if(sym->kind != SymbolKind::Local && sym->kind != SymbolKind::Param) {
+                return {};
+            }
+            auto it = locals.find(sym);
+            if(it == locals.end()) return {};
+            return it->second;
+        }
+        case NodeType::UnaryExpr: {
+            auto *unary = static_cast<UnaryExpr*>(expr);
+            if(unary->op != UnaryOp::Deref) return {};
+
+            auto type = sema.typeOf(unary->num.get());
+            if(!type || (type->kind != SemKind::Ref && type->kind != SemKind::Box)) {
+                return {};
+            }
+
+            auto ptr = lowerExpr(unary->num.get(), nullptr);
+            if(terminated() || ptr.type == nullptr) return {};
+            return ptr;
+        }
+        case NodeType::FieldExpr: {
+            //TODO
+            return {};
+        }
+        case NodeType::IndexExpr: {
+            //TODO
+            return {};
+        }
+        default:
+            return {};
+    }
+}
+
+IRValue Lower::lowerRef(Expr *expr) {
+    if(expr == nullptr) return {};
+
+    auto addr = lowerPlace(expr);
+    if(addr.type != nullptr) {
+        //place: get addr directly
+        return addr;
+    }
+
+    if(expr->typ == NodeType::FieldExpr || expr->typ == NodeType::IndexExpr) {
+        //TODO
+        return {};
+    }
+    //not place: alloca->store->get addr
+    auto operandType = sema.typeOf(expr);
+    if(!operandType || operandType->isError()) return {};
+
+    auto *type = irType(operandType);
+    if(type == nullptr || type->kind == IRKind::Void) return {};
+
+    auto value = lowerExpr(expr, nullptr);
+    if(terminated() || value.type == nullptr) return {};
+
+    if(isAggregateType(type)) {
+        return value;
+    }
+
+    auto slot = emitAlloca(type);
+    emitStore(value, slot, type);
+    return slot;
+}
+
 IRValue Lower::lowerUnaryExpr(UnaryExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
+    if(expr == nullptr || expr->num == nullptr) {
+        return {};
+    }
+    switch(expr->op) {
+        case UnaryOp::Neg: {
+            auto numType = sema.typeOf(expr->num.get());
+            if(!numType || numType->isError()) return {};
+
+            auto val = lowerExpr(expr->num.get(), nullptr);
+            if(terminated() || val.type == nullptr) return {};
+
+            auto exprType = sema.typeOf(expr);
+            if(!exprType || exprType->isError()) return {};
+
+            auto typ = irType(exprType);
+            if(typ == nullptr || typ->kind == IRKind::Void) {
+                return {};
+            }
+
+            if(numType->kind == SemKind::Ref) {
+                if(numType->isMut) return {};//invalid, already rejected in semantic
+                val = emitLoad(typ, val);
+            }
+
+            return emitBinaryOp(IROp::Sub, makeIRInt(0, typ), val);
+        }
+        case UnaryOp::Not: {
+            auto numType = sema.typeOf(expr->num.get());
+            if(!numType || numType->isError()) return {};
+
+            auto val = lowerExpr(expr->num.get(), nullptr);
+            if(terminated() || val.type == nullptr) return {};
+
+            auto exprType = sema.typeOf(expr);
+            if(!exprType || exprType->isError()) return {};
+
+            auto typ = irType(exprType);
+            if(typ == nullptr || typ->kind == IRKind::Void) {
+                return {};
+            }
+
+            if(numType->kind == SemKind::Ref) {
+                if(numType->isMut) return {};//invalid, already rejected in semantic
+                val = emitLoad(typ, val);
+            }
+
+            IRValue tmp = exprType->isBool() ? makeIRInt(1, types.i1()) : makeIRInt(-1, typ);
+            return emitBinaryOp(IROp::Xor, val, tmp);
+        }
+        case UnaryOp::Ref: {
+            return lowerRef(expr->num.get());
+        }
+        case UnaryOp::Deref: {
+            //scalar: load
+            //aggregate: ret ptr
+            auto numType = sema.typeOf(expr->num.get());
+            if(!numType || (numType->kind != SemKind::Ref && numType->kind != SemKind::Box)) {//invalid
+                return {};
+            }
+            auto ptr = lowerExpr(expr->num.get(), nullptr);
+            if(terminated() || ptr.type == nullptr) return {};
+
+            auto exprType = sema.typeOf(expr);
+            if(!exprType || exprType->isError()) return {};
+
+            auto typ = irType(exprType);
+            if(typ == nullptr || typ->kind == IRKind::Void) {
+                return {};
+            }
+
+            if(isAggregateType(typ)) {
+                return ptr;
+            }
+            return emitLoad(typ, ptr);
+        }
+        case UnaryOp::RefMut: {
+            return lowerRef(expr->num.get());
+        }
+    }
     return {};
 }
 
+IRValue Lower::lowerBinaryOperand(Expr *expr) {
+    if(expr == nullptr) return {};
+
+    auto type = sema.typeOf(expr);
+    if(!type || type->isError()) return {};
+
+    auto val = lowerExpr(expr, nullptr);
+    if(terminated() || val.type == nullptr) return {};
+
+    if(type->kind == SemKind::Ref) {
+        if(type->isMut) return {};
+
+        auto inner = type->inner;
+        if(!inner || (!inner->isInteger() && !inner->isBool())) return {};
+
+        auto *innerType = irType(inner);
+        if(innerType == nullptr || innerType->kind == IRKind::Void) return {};
+        val = emitLoad(innerType, val);
+    }
+
+    return val;
+}
+
+std::string Lower::typeKey(const SemTypePtr &type) {
+    if(!type) return "null";
+
+    switch(type->kind) {
+        case SemKind::I32:   return "i32";
+        case SemKind::U32:   return "u32";
+        case SemKind::Isize: return "isize";
+        case SemKind::Usize: return "usize";
+        case SemKind::Bool:  return "bool";
+        case SemKind::Unit:  return "unit";
+        case SemKind::Never: return "never";
+        case SemKind::Error: return "error";
+        case SemKind::Struct: {
+            std::ostringstream os;
+            os << "struct:";
+            if(type->structDef != nullptr) {
+                os << static_cast<const void *>(type->structDef);
+            }
+            else {
+                os << "null";
+            }
+            return os.str();
+        }
+        case SemKind::Array:
+            return "array:" + std::to_string(type->arrayLen) + ":" + typeKey(type->elem);
+        case SemKind::Box:
+            return "box:" + typeKey(type->inner);
+        case SemKind::Vec:
+            return "vec:" + typeKey(type->inner);
+        case SemKind::Ref:
+            return std::string("ref:") + (type->isMut ? "mut:" : "shared:") +
+                   typeKey(type->inner);
+    }
+
+    return "unknown";
+}
+
+std::string Lower::ensureEqHelper(const SemTypePtr &type) {
+    (void)type;
+    return {};
+}
+
+IRValue Lower::emitEqCall(const SemTypePtr &type, IRValue lhsAddr, IRValue rhsAddr) {
+    (void)type;
+    (void)lhsAddr;
+    (void)rhsAddr;
+    return {};
+}
+
+IRValue Lower::emitEqValue(const SemTypePtr &type, IRValue lhsAddr, IRValue rhsAddr) {
+    (void)type;
+    (void)lhsAddr;
+    (void)rhsAddr;
+    return {};
+}
+
+void Lower::pushFuncCtx() {
+    FuncCtx ctx;
+    ctx.func = curFunc;
+    ctx.nxReg = nxReg;
+    ctx.curBlock = curBlock;
+    ctx.curFuncIsMain = curFuncIsMain;
+    ctx.curFuncRet = curFuncRet;
+    ctx.curAggRet = curAggRet;
+    ctx.curSret = curSret;
+    ctx.locals = locals;
+    ctxStack.push_back(std::move(ctx));
+}
+
+void Lower::popFuncCtx() {
+    assert(!ctxStack.empty());
+
+    FuncCtx ctx = std::move(ctxStack.back());
+    ctxStack.pop_back();
+
+    curFunc = ctx.func;
+    nxReg = ctx.nxReg;
+    curBlock = ctx.curBlock;
+    curFuncIsMain = ctx.curFuncIsMain;
+    curFuncRet = ctx.curFuncRet;
+    curAggRet = ctx.curAggRet;
+    curSret = ctx.curSret;
+    locals = std::move(ctx.locals);
+}
+
+void Lower::generateEqHelpers() {
+}
+
+IRValue Lower::lowerEqAddress(Expr *expr, SemTypePtr type) {
+    if(type->kind == SemKind::Struct || type->kind == SemKind::Array || type->kind == SemKind::Vec) {
+        //aggregate
+        return lowerExpr(expr, nullptr);
+    }
+    else if(type->kind == SemKind::Ref || type->kind == SemKind::Box) {
+        auto addr = lowerPlace(expr);
+        if(addr.type != nullptr) return addr;
+
+        auto val = lowerExpr(expr, nullptr);
+        if(terminated() || val.type == nullptr) return {};
+
+        auto slot = emitAlloca(types.ptr());
+        emitStore(val, slot, types.ptr());
+        return slot;
+    }
+    return {};
+}
+
+IRValue Lower::lowerEquality(BinaryExpr *expr) {
+    if(expr == nullptr) return {};
+
+    auto lhsType = sema.typeOf(expr->lhs.get());
+    auto rhsType = sema.typeOf(expr->rhs.get());
+    if(!lhsType || !rhsType || lhsType->isError() || rhsType->isError()) {
+        return {};
+    }
+
+    SemTypePtr lhsTarget = lhsType;
+    SemTypePtr rhsTarget = rhsType;
+    while(lhsTarget && (lhsTarget->kind == SemKind::Ref ||
+                        lhsTarget->kind == SemKind::Box)) {
+        lhsTarget = lhsTarget->inner;
+    }
+    while(rhsTarget && (rhsTarget->kind == SemKind::Ref ||
+                        rhsTarget->kind == SemKind::Box)) {
+        rhsTarget = rhsTarget->inner;
+    }
+
+    if(!lhsTarget || !rhsTarget || !sameType(lhsTarget, rhsTarget)) {
+        return {};
+    }
+
+    bool scalar = lhsTarget->isInteger() || lhsTarget->isBool();
+    if(!scalar) {
+        IRValue lhsAddr = lowerEqAddress(expr->lhs.get(), lhsType);
+        if(lhsAddr.type == nullptr) return {};
+
+        IRValue rhsAddr = lowerEqAddress(expr->rhs.get(), rhsType);
+        if(rhsAddr.type == nullptr) return {};
+
+        IRValue eq = emitEqCall(lhsType, lhsAddr, rhsAddr);
+        if(eq.type == nullptr) return {};
+
+        if(expr->op == BinaryOp::Ne) {
+            return emitBinaryOp(IROp::Xor, eq, makeIRInt(1, types.i1()));
+        }
+        return eq;
+    }
+
+    IRValue lhs = lowerExpr(expr->lhs.get(), nullptr);
+    if(terminated() || lhs.type == nullptr) return {};
+
+    IRValue rhs = lowerExpr(expr->rhs.get(), nullptr);
+    if(terminated() || rhs.type == nullptr) return {};
+
+    while(lhsType && (lhsType->kind == SemKind::Ref ||
+                      lhsType->kind == SemKind::Box)) {
+        lhsType = lhsType->inner;
+        IRType *type = irType(lhsType);
+        if(type == nullptr || type->kind == IRKind::Void) return {};
+        lhs = emitLoad(type, lhs);
+    }
+    while(rhsType && (rhsType->kind == SemKind::Ref ||
+                      rhsType->kind == SemKind::Box)) {
+        rhsType = rhsType->inner;
+        IRType *type = irType(rhsType);
+        if(type == nullptr || type->kind == IRKind::Void) return {};
+        rhs = emitLoad(type, rhs);
+    }
+
+    IRCmp cmp = expr->op == BinaryOp::Eq ? IRCmp::Eq : IRCmp::Ne;
+    return emitICmp(cmp, lhs, rhs);
+}
+
+IRValue Lower::lowerOrdering(BinaryExpr *expr) {
+    if(expr == nullptr) return {};
+
+    auto lhsType = sema.typeOf(expr->lhs.get());
+    auto rhsType = sema.typeOf(expr->rhs.get());
+    if(!lhsType || !rhsType || lhsType->isError() || rhsType->isError()) {
+        return {};
+    }
+
+    IRValue lhs = lowerExpr(expr->lhs.get(), nullptr);
+    if(terminated() || lhs.type == nullptr) return {};
+
+    IRValue rhs = lowerExpr(expr->rhs.get(), nullptr);
+    if(terminated() || rhs.type == nullptr) return {};
+
+    while(lhsType && lhsType->kind == SemKind::Ref) {
+        lhsType = lhsType->inner;
+        IRType *type = irType(lhsType);
+        if(type == nullptr || type->kind == IRKind::Void) return {};
+        lhs = emitLoad(type, lhs);
+    }
+    while(rhsType && rhsType->kind == SemKind::Ref) {
+        rhsType = rhsType->inner;
+        IRType *type = irType(rhsType);
+        if(type == nullptr || type->kind == IRKind::Void) return {};
+        rhs = emitLoad(type, rhs);
+    }
+
+    if(!lhsType || !rhsType ||
+       (!lhsType->isInteger() && !lhsType->isBool()) ||
+       (!rhsType->isInteger() && !rhsType->isBool()) ||
+       !sameType(lhsType, rhsType)) {
+        return {};
+    }
+
+    bool isSigned = lhsType->isSignedInteger();
+    IRCmp cmp;
+    switch(expr->op) {
+        case BinaryOp::Lt: cmp = isSigned ? IRCmp::Slt : IRCmp::Ult; break;
+        case BinaryOp::Le: cmp = isSigned ? IRCmp::Sle : IRCmp::Ule; break;
+        case BinaryOp::Gt: cmp = isSigned ? IRCmp::Sgt : IRCmp::Ugt; break;
+        case BinaryOp::Ge: cmp = isSigned ? IRCmp::Sge : IRCmp::Uge; break;
+        default: return {};
+    }
+
+    return emitICmp(cmp, lhs, rhs);
+}
+
+IRValue Lower::lowerLogic(BinaryExpr *expr) {
+    if(expr == nullptr) return {};
+    if(expr->op != BinaryOp::LogicalAnd &&
+       expr->op != BinaryOp::LogicalOr) {
+        return {};
+    }
+
+    IRValue lhs = lowerExpr(expr->lhs.get(), nullptr);
+    if(terminated() || lhs.type == nullptr) return {};
+
+    IRValue slot = emitAlloca(types.i1());
+    size_t rhsBlock = newBlock("logic.rhs");
+    size_t shortBlock = newBlock("logic.short");
+    size_t mergeBlock = newBlock("logic.merge");
+
+    bool isAnd = expr->op == BinaryOp::LogicalAnd;
+    if(isAnd) {
+        emitCondBr(lhs, rhsBlock, shortBlock);
+    }
+    else {
+        emitCondBr(lhs, shortBlock, rhsBlock);
+    }
+
+    switchBlock(shortBlock);
+    emitStore(makeIRInt(isAnd ? 0 : 1, types.i1()), slot, types.i1());
+    emitBr(mergeBlock);
+
+    switchBlock(rhsBlock);
+    IRValue rhs = lowerExpr(expr->rhs.get(), nullptr);
+    if(terminated() || rhs.type == nullptr) return {};
+    emitStore(rhs, slot, types.i1());
+    emitBr(mergeBlock);
+
+    switchBlock(mergeBlock);
+    return emitLoad(types.i1(), slot);
+}
+
+IRValue Lower::lowerArithmeticOrShift(BinaryExpr *expr) {
+    if(expr == nullptr) return {};
+
+    auto lhsType = sema.typeOf(expr->lhs.get());
+    if(lhsType && lhsType->kind == SemKind::Ref) {
+        lhsType = lhsType->inner;
+    }
+    if(!lhsType || lhsType->isError()) return {};
+
+    IRValue lhs = lowerBinaryOperand(expr->lhs.get());
+    if(terminated() || lhs.type == nullptr) return {};
+
+    IRValue rhs = lowerBinaryOperand(expr->rhs.get());
+    if(terminated() || rhs.type == nullptr) return {};
+
+    switch(expr->op) {
+        case BinaryOp::Add: {
+            return emitBinaryOp(IROp::Add, lhs, rhs);
+        }
+        case BinaryOp::Sub: {
+            return emitBinaryOp(IROp::Sub, lhs, rhs);
+        }
+        case BinaryOp::Mul: {
+            return emitBinaryOp(IROp::Mul, lhs, rhs);
+        }
+        case BinaryOp::Div: {
+            return emitBinaryOp(lhsType->isSignedInteger() ? IROp::SDiv : IROp::UDiv, lhs, rhs);
+        }
+        case BinaryOp::Mod: {
+            return emitBinaryOp(lhsType->isSignedInteger() ? IROp::SRem : IROp::URem, lhs, rhs);
+        }
+        case BinaryOp::BitAnd: {
+            return emitBinaryOp(IROp::And, lhs, rhs);
+        }
+        case BinaryOp::BitOr: {
+            return emitBinaryOp(IROp::Or, lhs, rhs);
+        }
+        case BinaryOp::BitXor: {
+            return emitBinaryOp(IROp::Xor, lhs, rhs);
+        }
+        case BinaryOp::Shl: {
+            IRValue count = emitBinaryOp(IROp::And, rhs, makeIRInt(31, rhs.type));
+            return emitBinaryOp(IROp::Shl, lhs, count);
+        }
+        case BinaryOp::Shr: {
+            IRValue count = emitBinaryOp(IROp::And, rhs, makeIRInt(31, rhs.type));
+            return emitBinaryOp(lhsType->isSignedInteger() ? IROp::AShr : IROp::LShr,
+                                lhs, count);
+        }
+        default:
+            return {};
+    }
+}
+
 IRValue Lower::lowerBinaryExpr(BinaryExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
+    if(expr == nullptr) return {};
+
+    switch(expr->op) {
+        case BinaryOp::Add:
+        case BinaryOp::Sub:
+        case BinaryOp::Mul:
+        case BinaryOp::Div:
+        case BinaryOp::Mod:
+        case BinaryOp::BitAnd:
+        case BinaryOp::BitOr:
+        case BinaryOp::BitXor:
+        case BinaryOp::Shl:
+        case BinaryOp::Shr: {
+            return lowerArithmeticOrShift(expr);
+        }
+        case BinaryOp::Eq:
+        case BinaryOp::Ne: {
+            return lowerEquality(expr);
+        }
+        case BinaryOp::Lt:
+        case BinaryOp::Le:
+        case BinaryOp::Gt:
+        case BinaryOp::Ge: {
+            return lowerOrdering(expr);
+        }
+        case BinaryOp::LogicalAnd:
+        case BinaryOp::LogicalOr: {
+            return lowerLogic(expr);
+        }
+    }
     return {};
 }
 
@@ -707,7 +1366,7 @@ IRValue Lower::lowerReturnExpr(ReturnExpr *expr, const SemTypePtr &expected) {
             (void)v;
             if(terminated()) return {};
         }
-        emitRet(IRValue{IRValueKind::Int, types.i32(), 0, 0, nullptr});
+        emitRet(makeIRInt(0, types.i32()));
         return {};
     }
 
