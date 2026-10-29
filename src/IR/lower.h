@@ -111,6 +111,11 @@ private:
     void pushFuncCtx();
     void popFuncCtx();
     void generateEqHelpers();
+    void generateStructEqHelper(const SemTypePtr &type);
+    void generateArrayEqHelper(const SemTypePtr &type);
+    void generateVecEqHelper(const SemTypePtr &type);
+    void generateRefEqHelper(const SemTypePtr &type);
+    void generateBoxEqHelper(const SemTypePtr &type);
     IRValue lowerBinaryExpr(BinaryExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerAssignExpr(AssignExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerFieldExpr(FieldExpr *expr, const SemTypePtr &expected = nullptr);

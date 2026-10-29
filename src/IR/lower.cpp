@@ -1037,22 +1037,30 @@ std::string Lower::typeKey(const SemTypePtr &type) {
 }
 
 std::string Lower::ensureEqHelper(const SemTypePtr &type) {
-    (void)type;
-    return {};
+    std::string key = typeKey(type);
+    auto it = eqHelperNames.find(key);
+    if(it != eqHelperNames.end()) {
+        return it->second;
+    }
+    std::string name = "__rx_eq$" + std::to_string(eqHelperCounter);
+    eqHelperCounter++;
+    eqHelperNames[key] = name;
+    pendingEqTypes.push_back(type);
+    return name;
 }
 
 IRValue Lower::emitEqCall(const SemTypePtr &type, IRValue lhsAddr, IRValue rhsAddr) {
-    (void)type;
-    (void)lhsAddr;
-    (void)rhsAddr;
-    return {};
+    std::string name = ensureEqHelper(type);
+    return emitCall(name, types.i1(), {lhsAddr, rhsAddr}, false);
 }
 
 IRValue Lower::emitEqValue(const SemTypePtr &type, IRValue lhsAddr, IRValue rhsAddr) {
-    (void)type;
-    (void)lhsAddr;
-    (void)rhsAddr;
-    return {};
+    if(type->isInteger() || type->isBool()) {
+        auto lhs = emitLoad(irType(type), lhsAddr);
+        auto rhs = emitLoad(irType(type), rhsAddr);
+        return emitICmp(IRCmp::Eq, lhs, rhs);
+    }
+    return emitEqCall(type, lhsAddr, rhsAddr);
 }
 
 void Lower::pushFuncCtx() {
@@ -1085,6 +1093,246 @@ void Lower::popFuncCtx() {
 }
 
 void Lower::generateEqHelpers() {
+    for(size_t i = 0; i < pendingEqTypes.size(); i++) {
+        SemTypePtr type = pendingEqTypes[i];
+        auto it = eqHelperNames.find(typeKey(type));
+        if(it == eqHelperNames.end()) {
+            continue;
+        }
+
+        pushFuncCtx();
+
+        auto func = std::make_unique<IRFunc>();
+        func->name = it->second;
+        func->retType = types.i1();
+        module.funcs.push_back(std::move(func));
+        curFunc = module.funcs.back().get();
+
+        nxReg = 0;
+        curBlock = 0;
+        locals.clear();
+        curFuncIsMain = false;
+        curFuncRet = nullptr;
+        curAggRet = false;
+        curSret = {};
+        curBlock = newBlock("entry");
+
+        IRValue lhs = newReg(types.ptr());
+        IRValue rhs = newReg(types.ptr());
+        curFunc->params.push_back(lhs);
+        curFunc->params.push_back(rhs);
+
+        switch(type->kind) {
+            case SemKind::Struct:
+                generateStructEqHelper(type);
+                break;
+            case SemKind::Array:
+                generateArrayEqHelper(type);
+                break;
+            case SemKind::Vec:
+                generateVecEqHelper(type);
+                break;
+            case SemKind::Ref:
+                generateRefEqHelper(type);
+                break;
+            case SemKind::Box:
+                generateBoxEqHelper(type);
+                break;
+            default:
+                break;
+        }
+
+        if(!terminated()) {
+            emitUnreachable();
+        }
+        popFuncCtx();
+    }
+}
+
+void Lower::generateStructEqHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Struct || type->structDef == nullptr) {
+        return;
+    }
+
+    auto it = sema.structs.find(type->structDef);
+    if(it == sema.structs.end()) {
+        return;
+    }
+
+    IRStruct *info = irStruct(type->structDef);
+    IRType *structType = irType(type);
+    if(info == nullptr || structType == nullptr) {
+        return;
+    }
+
+    IRValue lhs = curFunc->params[0];
+    IRValue rhs = curFunc->params[1];
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue result = makeIRInt(1, types.i1());
+
+    for(size_t i = 0; i < it->second.fields.size(); i++) {
+        IRValue index = makeIRInt(static_cast<long long>(i), types.i32());
+        std::vector<IRValue> indices{zero, index};
+
+        IRValue lhsField = emitGep(structType, lhs, indices);
+        IRValue rhsField = emitGep(structType, rhs, indices);
+        IRValue fieldEq = emitEqValue(it->second.fields[i].type, lhsField, rhsField);
+        if(fieldEq.type == nullptr) {
+            return;
+        }
+
+        result = emitBinaryOp(IROp::And, result, fieldEq);
+    }
+
+    emitRet(result);
+}
+
+void Lower::generateArrayEqHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Array || type->elem == nullptr) {
+        return;
+    }
+
+    IRType *arrayType = irType(type);
+    if(arrayType == nullptr) {
+        return;
+    }
+
+    IRValue lhs = curFunc->params[0];
+    IRValue rhs = curFunc->params[1];
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue one = makeIRInt(1, types.i32());
+
+    IRValue indexSlot = emitAlloca(types.i32());
+    emitStore(makeIRInt(0, types.i32()), indexSlot, types.i32());
+    IRValue okSlot = emitAlloca(types.i1());
+    emitStore(makeIRInt(1, types.i1()), okSlot, types.i1());
+
+    size_t loopBlock = newBlock("eq.loop");
+    size_t bodyBlock = newBlock("eq.body");
+    size_t doneBlock = newBlock("eq.done");
+
+    emitBr(loopBlock);
+
+    switchBlock(loopBlock);
+    IRValue index = emitLoad(types.i32(), indexSlot);
+    IRValue cond = emitICmp(IRCmp::Ult, index,
+                            makeIRInt(static_cast<long long>(type->arrayLen), types.i32()));
+    emitCondBr(cond, bodyBlock, doneBlock);
+
+    switchBlock(bodyBlock);
+    std::vector<IRValue> indices{zero, index};
+    IRValue lhsElem = emitGep(arrayType, lhs, indices);
+    IRValue rhsElem = emitGep(arrayType, rhs, indices);
+    IRValue elemEq = emitEqValue(type->elem, lhsElem, rhsElem);
+    if(elemEq.type == nullptr) {
+        return;
+    }
+
+    IRValue ok = emitLoad(types.i1(), okSlot);
+    IRValue nextOk = emitBinaryOp(IROp::And, ok, elemEq);
+    emitStore(nextOk, okSlot, types.i1());
+
+    IRValue nextIndex = emitBinaryOp(IROp::Add, index, one);
+    emitStore(nextIndex, indexSlot, types.i32());
+    emitBr(loopBlock);
+
+    switchBlock(doneBlock);
+    emitRet(emitLoad(types.i1(), okSlot));
+}
+
+void Lower::generateVecEqHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Vec || type->inner == nullptr) {
+        return;
+    }
+
+    IRType *headerType = irType(type);
+    IRType *elemType = irType(type->inner);
+    if(headerType == nullptr || elemType == nullptr) {
+        return;
+    }
+
+    IRValue lhs = curFunc->params[0];
+    IRValue rhs = curFunc->params[1];
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue one = makeIRInt(1, types.i32());
+
+    std::vector<IRValue> lenIndices{zero, one};
+    IRValue lenL = emitLoad(types.i32(), emitGep(headerType, lhs, lenIndices));
+    IRValue lenR = emitLoad(types.i32(), emitGep(headerType, rhs, lenIndices));
+    IRValue lenEq = emitICmp(IRCmp::Eq, lenL, lenR);
+
+    IRValue indexSlot = emitAlloca(types.i32());
+    emitStore(makeIRInt(0, types.i32()), indexSlot, types.i32());
+    IRValue okSlot = emitAlloca(types.i1());
+    emitStore(makeIRInt(1, types.i1()), okSlot, types.i1());
+
+    size_t falseBlock = newBlock("eq.false");
+    size_t lenOkBlock = newBlock("eq.len_ok");
+    size_t loopBlock = newBlock("eq.loop");
+    size_t bodyBlock = newBlock("eq.body");
+    size_t doneBlock = newBlock("eq.done");
+
+    emitCondBr(lenEq, lenOkBlock, falseBlock);
+
+    switchBlock(falseBlock);
+    emitRet(makeIRInt(0, types.i1()));
+
+    switchBlock(lenOkBlock);
+    std::vector<IRValue> dataIndices{zero, zero};
+    IRValue dataL = emitLoad(types.ptr(), emitGep(headerType, lhs, dataIndices));
+    IRValue dataR = emitLoad(types.ptr(), emitGep(headerType, rhs, dataIndices));
+    emitBr(loopBlock);
+
+    switchBlock(loopBlock);
+    IRValue index = emitLoad(types.i32(), indexSlot);
+    IRValue cond = emitICmp(IRCmp::Ult, index, lenL);
+    emitCondBr(cond, bodyBlock, doneBlock);
+
+    switchBlock(bodyBlock);
+    std::vector<IRValue> elemIndices{index};
+    IRValue lhsElem = emitGep(elemType, dataL, elemIndices);
+    IRValue rhsElem = emitGep(elemType, dataR, elemIndices);
+    IRValue elemEq = emitEqValue(type->inner, lhsElem, rhsElem);
+    if(elemEq.type == nullptr) {
+        return;
+    }
+
+    IRValue ok = emitLoad(types.i1(), okSlot);
+    IRValue nextOk = emitBinaryOp(IROp::And, ok, elemEq);
+    emitStore(nextOk, okSlot, types.i1());
+
+    IRValue nextIndex = emitBinaryOp(IROp::Add, index, one);
+    emitStore(nextIndex, indexSlot, types.i32());
+    emitBr(loopBlock);
+
+    switchBlock(doneBlock);
+    emitRet(emitLoad(types.i1(), okSlot));
+}
+
+void Lower::generateRefEqHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Ref || type->inner == nullptr) {
+        return;
+    }
+
+    IRValue lhsPtr = emitLoad(types.ptr(), curFunc->params[0]);
+    IRValue rhsPtr = emitLoad(types.ptr(), curFunc->params[1]);
+    IRValue eq = emitEqValue(type->inner, lhsPtr, rhsPtr);
+    if(eq.type != nullptr) {
+        emitRet(eq);
+    }
+}
+
+void Lower::generateBoxEqHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Box || type->inner == nullptr) {
+        return;
+    }
+
+    IRValue lhsPtr = emitLoad(types.ptr(), curFunc->params[0]);
+    IRValue rhsPtr = emitLoad(types.ptr(), curFunc->params[1]);
+    IRValue eq = emitEqValue(type->inner, lhsPtr, rhsPtr);
+    if(eq.type != nullptr) {
+        emitRet(eq);
+    }
 }
 
 IRValue Lower::lowerEqAddress(Expr *expr, SemTypePtr type) {
