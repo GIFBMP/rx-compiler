@@ -873,12 +873,10 @@ IRValue Lower::lowerPlace(Expr *expr) {
             return ptr;
         }
         case NodeType::FieldExpr: {
-            //TODO
-            return {};
+            return lowerFieldAddress(static_cast<FieldExpr*>(expr));
         }
         case NodeType::IndexExpr: {
-            //TODO
-            return {};
+            return lowerIndexAddress(static_cast<IndexExpr*>(expr));
         }
         default:
             return {};
@@ -1713,9 +1711,21 @@ IRValue Lower::lowerAssignExpr(AssignExpr *expr, const SemTypePtr &expected) {
 }
 
 IRValue Lower::lowerFieldExpr(FieldExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+
+    IRValue addr = lowerFieldAddress(expr);
+    if(addr.type == nullptr) return {};
+
+    auto resultType = sema.typeOf(expr);
+    if(!resultType || resultType->isError()) return {};
+
+    IRType *resultIR = irType(resultType);
+    if(resultIR == nullptr || resultIR->kind == IRKind::Void) return {};
+
+    if(isAggregateType(resultIR)) {
+        return addr;
+    }
+    return emitLoad(resultIR, addr);
 }
 
 IRValue Lower::lowerReturnExpr(ReturnExpr *expr, const SemTypePtr &expected) {
@@ -1769,6 +1779,7 @@ IRValue Lower::lowerBreakExpr(BreakExpr *expr, const SemTypePtr &expected) {
 
     LoopCtx &ctx = loopStack.back();
     if(expr->val == nullptr) {
+        ctx.exitReachable = true;
         emitBr(ctx.breakBlock);
         return {};
     }
@@ -1793,6 +1804,7 @@ IRValue Lower::lowerBreakExpr(BreakExpr *expr, const SemTypePtr &expected) {
         emitStore(value, ctx.resultSlot, resultIR);
     }
 
+    ctx.exitReachable = true;
     emitBr(ctx.breakBlock);
     return {};
 }
@@ -1933,6 +1945,7 @@ IRValue Lower::lowerWhileExpr(WhileExpr *expr, const SemTypePtr &expected) {
     ctx.continueBlock = condBlock;
     ctx.isWhile = true;
     ctx.hasResult = false;
+    ctx.exitReachable = true;
     ctx.resultSlot = {};
     ctx.resultType = nullptr;
     loopStack.push_back(ctx);
@@ -1949,27 +1962,291 @@ IRValue Lower::lowerWhileExpr(WhileExpr *expr, const SemTypePtr &expected) {
 }
 
 IRValue Lower::lowerLoopExpr(LoopExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+
+    auto resultType = sema.typeOf(expr);
+    if(!resultType || resultType->isError()) return {};
+
+    bool hasResult = resultType->kind != SemKind::Unit &&
+                     resultType->kind != SemKind::Never;
+    IRType *resultIR = nullptr;
+    IRValue resultSlot;
+    if(hasResult) {
+        resultIR = irType(resultType);
+        if(resultIR == nullptr || resultIR->kind == IRKind::Void) {
+            return {};
+        }
+        resultSlot = emitAlloca(resultIR);
+    }
+
+    size_t entryBlock = curBlock;
+    size_t bodyBlock = newBlock("loop.body");
+    size_t exitBlock = newBlock("loop.exit");
+
+    switchBlock(entryBlock);
+    emitBr(bodyBlock);
+    switchBlock(bodyBlock);
+
+    LoopCtx ctx;
+    ctx.breakBlock = exitBlock;
+    ctx.continueBlock = bodyBlock;
+    ctx.isWhile = false;
+    ctx.hasResult = hasResult;
+    ctx.exitReachable = false;
+    ctx.resultSlot = resultSlot;
+    ctx.resultType = resultType;
+    loopStack.push_back(ctx);
+
+    lowerBlockExpr(expr->body.get(), SemType::makeUnit());
+
+    bool exitReachable = loopStack.back().exitReachable;
+    loopStack.pop_back();
+
+    if(!terminated()) {
+        emitBr(bodyBlock);
+    }
+
+    switchBlock(exitBlock);
+
+    if(!exitReachable) {
+        emitUnreachable();
+        return {};
+    }
+
+    if(!hasResult) {
+        return {};
+    }
+
+    if(isAggregateType(resultIR)) {
+        return resultSlot;
+    }
+    return emitLoad(resultIR, resultSlot);
 }
 
 IRValue Lower::lowerStructExpr(StructExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+
+    auto *sym = sema.symbolOf(expr);
+    if(!sym || sym->decl == nullptr) return {};
+
+    auto *def = static_cast<const StructDefItem*>(sym->decl);
+    auto it = sema.structs.find(def);
+    if(it == sema.structs.end()) return {};
+
+    auto *typ = irType(sema.typeOf(expr));
+    if(typ == nullptr || typ->kind == IRKind::Void) return {};
+
+    auto &info = it->second;
+    auto slot = emitAlloca(typ);
+    IRValue zero = makeIRInt(0, types.i32());
+
+    for(auto &field: expr->fields) {
+        auto fieldIt = info.fieldIndex.find(field->name);
+        if(fieldIt == info.fieldIndex.end()) return {};
+
+        size_t index = fieldIt->second;
+        const auto &fieldType = info.fields[index].type;
+        IRType *fieldIR = irType(fieldType);
+        if(fieldIR == nullptr || fieldIR->kind == IRKind::Void) return {};
+
+        IRValue val = lowerExpr(field->value.get(), fieldType);
+        if(terminated() || val.type == nullptr) return {};
+
+        val = coerce(val, sema.typeOf(field->value.get()), fieldType);
+        if(terminated() || val.type == nullptr) return {};
+
+        IRValue fieldAddr = emitGep(typ, slot, {
+            zero,
+            makeIRInt(static_cast<long long>(index), types.i32())
+        });
+
+        if(isAggregateType(fieldIR)) {
+            emitMemcpy(fieldAddr, val, fieldIR->size);
+        }
+        else {
+            emitStore(val, fieldAddr, fieldIR);
+        }
+    }
+
+    return slot;
 }
 
 IRValue Lower::lowerArrayExpr(ArrayExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
+
+    auto resultType = sema.typeOf(expr);
+    if(!resultType || resultType->kind != SemKind::Array) {
+        return {};
+    }
+
+    IRType *arrayIR = irType(resultType);
+    if(arrayIR == nullptr || arrayIR->kind != IRKind::Array) {
+        return {};
+    }
+
+    IRType *elemIR = arrayIR->elem;
+    if(elemIR == nullptr || elemIR->kind == IRKind::Void) {
+        return {};
+    }
+
+    IRValue slot = emitAlloca(arrayIR);
+    IRValue zero = makeIRInt(0, types.i32());
+
+    if(expr->isRepeat) {
+        IRValue value = lowerExpr(expr->repeatValue.get(), resultType->elem);
+        if(terminated() || value.type == nullptr) return {};
+
+        value = coerce(value, sema.typeOf(expr->repeatValue.get()), resultType->elem);
+        if(terminated() || value.type == nullptr) return {};
+
+        IRValue firstAddr = emitGep(arrayIR, slot, {zero, zero});
+        if(isAggregateType(elemIR)) {
+            emitMemcpy(firstAddr, value, elemIR->size);
+        }
+        else {
+            emitStore(value, firstAddr, elemIR);
+        }
+
+        for(size_t i = 1; i < resultType->arrayLen; i++) {
+            IRValue elemAddr = emitGep(arrayIR, slot, {
+                zero,
+                makeIRInt(static_cast<long long>(i), types.i32())
+            });
+            emitMemcpy(elemAddr, firstAddr, elemIR->size);
+        }
+
+        return slot;
+    }
+
+    for(size_t i = 0; i < expr->elems.size(); i++) {
+        auto *elemExpr = expr->elems[i].get();
+        IRValue value = lowerExpr(elemExpr, resultType->elem);
+        if(terminated() || value.type == nullptr) return {};
+
+        value = coerce(value, sema.typeOf(elemExpr), resultType->elem);
+        if(terminated() || value.type == nullptr) return {};
+
+        IRValue elemAddr = emitGep(arrayIR, slot, {
+            zero,
+            makeIRInt(static_cast<long long>(i), types.i32())
+        });
+
+        if(isAggregateType(elemIR)) {
+            emitMemcpy(elemAddr, value, elemIR->size);
+        }
+        else {
+            emitStore(value, elemAddr, elemIR);
+        }
+    }
+
+    return slot;
+}
+
+IRValue Lower::lowerAggregateBase(Expr *base, SemTypePtr &type) {
+    if(base == nullptr) return {};
+
+    type = sema.typeOf(base);
+    if(!type || type->isError()) return {};
+
+    IRValue addr = lowerExpr(base, nullptr);
+    if(terminated() || addr.type == nullptr) return {};
+
+    SemTypePtr cur = type;
+    while(cur && (cur->kind == SemKind::Ref || cur->kind == SemKind::Box)) {
+        SemTypePtr inner = cur->inner;
+        if(!inner) return {};
+
+        if(inner->kind == SemKind::Ref || inner->kind == SemKind::Box) {
+            addr = emitLoad(types.ptr(), addr);
+            cur = inner;
+        }
+        else {
+            cur = inner;
+            break;
+        }
+    }
+
+    type = cur;
+    return addr;
+}
+
+IRValue Lower::lowerFieldAddress(FieldExpr *expr) {
+    if(expr == nullptr) return {};
+
+    SemTypePtr baseType;
+    IRValue addr = lowerAggregateBase(expr->base.get(), baseType);
+    if(addr.type == nullptr || !baseType || baseType->kind != SemKind::Struct) {
+        return {};
+    }
+
+    auto it = sema.structs.find(baseType->structDef);
+    if(it == sema.structs.end()) return {};
+
+    auto fieldIt = it->second.fieldIndex.find(expr->field);
+    if(fieldIt == it->second.fieldIndex.end()) return {};
+
+    IRType *structIR = irType(baseType);
+    if(structIR == nullptr || structIR->kind != IRKind::Struct) return {};
+
+    return emitGep(structIR, addr, {
+        makeIRInt(0, types.i32()),
+        makeIRInt(static_cast<long long>(fieldIt->second), types.i32())
+    });
+}
+
+IRValue Lower::lowerIndexAddress(IndexExpr *expr) {
+    if(expr == nullptr) return {};
+
+    SemTypePtr cur;
+    IRValue addr = lowerAggregateBase(expr->base.get(), cur);
+    if(addr.type == nullptr || !cur) return {};
+
+    IRValue index = lowerExpr(expr->index.get(), SemType::make(SemKind::Usize));
+    if(terminated() || index.type == nullptr) return {};
+
+    if(cur->kind == SemKind::Array) {
+        IRType *arrayIR = irType(cur);
+        if(arrayIR == nullptr || arrayIR->kind != IRKind::Array) return {};
+
+        return emitGep(arrayIR, addr, {
+            makeIRInt(0, types.i32()),
+            index
+        });
+    }
+
+    if(cur->kind == SemKind::Vec) {
+        IRType *headerIR = types.vecHeader();
+        IRValue dataAddr = emitGep(headerIR, addr, {
+            makeIRInt(0, types.i32()),
+            makeIRInt(0, types.i32())
+        });
+        IRValue dataPtr = emitLoad(types.ptr(), dataAddr);
+
+        IRType *elemIR = irType(cur->inner);
+        if(elemIR == nullptr || elemIR->kind == IRKind::Void) return {};
+
+        return emitGep(elemIR, dataPtr, {index});
+    }
+
     return {};
 }
 
 IRValue Lower::lowerIndexExpr(IndexExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+
+    IRValue addr = lowerIndexAddress(expr);
+    if(addr.type == nullptr) return {};
+
+    auto resultType = sema.typeOf(expr);
+    if(!resultType || resultType->isError()) return {};
+
+    IRType *resultIR = irType(resultType);
+    if(resultIR == nullptr || resultIR->kind == IRKind::Void) return {};
+
+    if(isAggregateType(resultIR)) {
+        return addr;
+    }
+    return emitLoad(resultIR, addr);
 }
 
 IRValue Lower::lowerBuiltinIO(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op) {

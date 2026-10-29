@@ -13,6 +13,7 @@ struct LoopCtx {
     size_t continueBlock = 0;
     bool isWhile = false;
     bool hasResult = false;
+    bool exitReachable = false;
     IRValue resultSlot;
     SemTypePtr resultType;
 };
@@ -142,6 +143,9 @@ private:
     IRValue lowerLoopExpr(LoopExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerStructExpr(StructExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerArrayExpr(ArrayExpr *expr, const SemTypePtr &expected = nullptr);
+    IRValue lowerAggregateBase(Expr *base, SemTypePtr &type);
+    IRValue lowerFieldAddress(FieldExpr *expr);
+    IRValue lowerIndexAddress(IndexExpr *expr);
     IRValue lowerIndexExpr(IndexExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerCallExpr(CallExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerMethodCallExpr(MethodCallExpr *expr, const SemTypePtr &expected = nullptr);
