@@ -1,6 +1,7 @@
 #pragma once
 #include "AstNode.h"
 #include <vector>
+namespace rx::ast {
 
 struct PathType : public Type {
     std::vector<PathSegment> segments;
@@ -27,3 +28,4 @@ struct ParenthesizedType : public Type {
     NodePtr<Type> inner;
     explicit ParenthesizedType(SourceSpan span) : Type(NodeType::ParenthesizedType, span) {}
 };
+} // namespace rx::ast

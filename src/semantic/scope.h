@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+namespace rx::semantic {
+using namespace rx::ast;
 
 //only local/params
 //global func/const/struct will be processed in SemanticAnalyzer
@@ -49,3 +51,4 @@ private:
     //arena: keep the ptr of Symbols after the Scope is deconstructed
     std::unordered_map<std::string, Symbol *> names;
 };
+} // namespace rx::semantic

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 
+namespace rx::ast {
 namespace astdump {
 
 inline std::string spanStr(const SourceSpan &s) {
@@ -483,3 +484,4 @@ inline void dump(const AstNode *node, std::ostream &os) {
 }
 
 } // namespace astdump
+} // namespace rx::ast

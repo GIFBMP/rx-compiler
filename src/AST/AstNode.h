@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include "antlr4-runtime.h"
+namespace rx::ast {
 
 struct SourceSpan { 
     size_t beginLine, beginCol, endLine, endCol; 
@@ -144,3 +145,4 @@ enum class AssignOp {
 };
 
 enum class Derive {Copy, Clone, PartialEq, Eq};
+} // namespace rx::ast

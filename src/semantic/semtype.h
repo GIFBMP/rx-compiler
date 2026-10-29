@@ -4,8 +4,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-struct StructDefItem;
+namespace rx::ast { struct StructDefItem; }
+namespace rx::semantic {
+using rx::ast::StructDefItem;
 
 enum class SemKind {
     I32, U32, Isize, Usize, Bool,
@@ -183,3 +184,4 @@ inline std::string typeToString(const SemTypePtr &t) {
     }
     return "<error>";
 }
+} // namespace rx::semantic

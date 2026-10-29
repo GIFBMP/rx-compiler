@@ -4,9 +4,10 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+namespace rx::semantic {
+using namespace rx::ast;
 
 struct Symbol;
-struct PathExpr;
 class SemanticAnalyzer;
 
 enum class ConstKind {
@@ -62,3 +63,4 @@ private:
     std::unordered_set<const Symbol *> visiting;
     std::unordered_set<const Symbol *> failed;
 };
+} // namespace rx::semantic

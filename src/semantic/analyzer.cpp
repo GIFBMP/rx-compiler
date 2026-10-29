@@ -6,6 +6,8 @@
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+namespace rx::semantic {
+using namespace rx::ast;
 
 static bool placeDerefMut(const SemTypePtr &type, bool baseMut);
 
@@ -2212,3 +2214,4 @@ TypeLayout SemanticAnalyzer::layoutOf(const SemTypePtr &type) const {
         }
     }
 }
+} // namespace rx::semantic

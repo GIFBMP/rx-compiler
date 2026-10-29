@@ -11,6 +11,10 @@
 #include "IR/lower.h"
 #include "IR/LLVMEmit.h"
 
+using namespace rx::ast;
+using namespace rx::semantic;
+using namespace rx::ir;
+
 static std::string readAll(std::istream &in) {
     std::ostringstream ss;
     ss << in.rdbuf();

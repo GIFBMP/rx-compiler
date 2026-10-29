@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+namespace rx::ast {
 namespace astcheck {
 
 inline void check(const AstNode *node, std::vector<std::string> &errors) {
@@ -258,3 +259,4 @@ inline std::vector<std::string> check(const AstNode *root) {
 }
 
 } // namespace astcheck
+} // namespace rx::ast

@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+namespace rx::semantic {
+using namespace rx::ast;
 
 struct FuncSig {
     std::vector<SemTypePtr> params;
@@ -86,3 +88,4 @@ struct SemaResult {
         return it == builtinOps.end() ? BuiltinOp::None : it->second;
     }
 };
+} // namespace rx::semantic

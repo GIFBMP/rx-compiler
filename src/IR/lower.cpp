@@ -3,6 +3,9 @@
 
 #include <sstream>
 #include <utility>
+namespace rx::ir {
+using namespace rx::ast;
+using namespace rx::semantic;
 
 static bool isAggregateType(const IRType *type) {
     return type != nullptr &&
@@ -22,6 +25,7 @@ IRModule Lower::lower(Crate *crate) {
     pendingEqTypes.clear();
     eqHelperCounter = 0;
     ctxStack.clear();
+    loopStack.clear();
 
     IntFmt = getFmtGlobal("%d", ".fmt_int");
     IntlnFmt = getFmtGlobal("%d\n", ".fmt_int_nl");
@@ -315,6 +319,26 @@ IRValue Lower::emitICmp(IRCmp cmp, IRValue lhs, IRValue rhs) {
     return instr.dst;
 }
 
+IRValue Lower::emitZext(IRValue value, IRType *type) {
+    assert(value.type != nullptr);
+    assert(type != nullptr);
+    assert(value.type != type);
+    assert(value.type->kind == IRKind::I1 ||
+           value.type->kind == IRKind::I8 ||
+           value.type->kind == IRKind::I32);
+    assert(type->kind == IRKind::I8 ||
+           type->kind == IRKind::I32);
+
+    IRInstr instr;
+    instr.op = IROp::Zext;
+    instr.type = type;
+    instr.dst = newReg(type);
+    instr.hasDst = true;
+    instr.args.push_back(value);
+    emit(instr);
+    return instr.dst;
+}
+
 IRValue Lower::emitBinaryOp(IROp op, IRValue lhs, IRValue rhs) {
     switch(op) {
         case IROp::Add:
@@ -597,6 +621,7 @@ void Lower::lowerFunc(FuncDefItem *item) {
     nxReg = 0;
     curBlock = 0;
     locals.clear();
+    loopStack.clear();
     curFuncRet = sig.ret;
     curFuncIsMain = isMain;//re-initialize
     curAggRet = aggRet;
@@ -1594,10 +1619,97 @@ IRValue Lower::lowerBinaryExpr(BinaryExpr *expr, const SemTypePtr &expected) {
     return {};
 }
 
+IRValue Lower::emitCompoundAssign(AssignOp op, IRValue lhs, IRValue rhs, SemTypePtr type) {
+    switch(op) {
+        case AssignOp::Add: {
+            return emitBinaryOp(IROp::Add, lhs, rhs);
+        }
+        case AssignOp::Sub: {
+            return emitBinaryOp(IROp::Sub, lhs, rhs);
+        }
+        case AssignOp::Mul: {
+            return emitBinaryOp(IROp::Mul, lhs, rhs);
+        }
+        case AssignOp::Div: {
+            return emitBinaryOp(type->isSignedInteger() ? IROp::SDiv : IROp::UDiv, lhs, rhs);
+        }
+        case AssignOp::Mod: {
+            return emitBinaryOp(type->isSignedInteger() ? IROp::SRem : IROp::URem, lhs, rhs);
+        }
+        case AssignOp::BitAnd: {
+            return emitBinaryOp(IROp::And, lhs, rhs);
+        }
+        case AssignOp::BitOr: {
+            return emitBinaryOp(IROp::Or, lhs, rhs);
+        }
+        case AssignOp::BitXor: {
+            return emitBinaryOp(IROp::Xor, lhs, rhs);
+        }
+        case AssignOp::Shl: {
+            IRValue count = emitBinaryOp(IROp::And, rhs, makeIRInt(31, rhs.type));
+            return emitBinaryOp(IROp::Shl, lhs, count);
+        }
+        case AssignOp::Shr: {
+            IRValue count = emitBinaryOp(IROp::And, rhs, makeIRInt(31, rhs.type));
+            return emitBinaryOp(type->isSignedInteger() ? IROp::AShr : IROp::LShr,
+                                lhs, count);
+        }
+        default: {
+            return {};
+        }
+    }
+}
+
 IRValue Lower::lowerAssignExpr(AssignExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+    auto lhsType = sema.typeOf(expr->lhs.get());
+    if(!lhsType || lhsType->isError()) return {};
+
+    if(expr->op == AssignOp::Assign) {
+        auto rhs = lowerExpr(expr->rhs.get(), lhsType);
+        if(terminated() || rhs.type == nullptr) return {};
+        rhs = coerce(rhs, sema.typeOf(expr->rhs.get()), lhsType);
+        if(terminated() || rhs.type == nullptr) return {};
+
+        auto lhsAddr = lowerPlace(expr->lhs.get());
+        if(lhsAddr.type == nullptr) return {};
+        auto typ = irType(lhsType);
+        if(typ == nullptr || typ->kind == IRKind::Void) return {};
+        if(isAggregateType(typ)) {
+            emitMemmove(lhsAddr, rhs, makeIRInt(typ->size));
+        }
+        else {
+            emitStore(rhs, lhsAddr, typ);
+        }
+        return {};
+    }
+    else {
+        //spec: rhs->lhs->deref rhs
+        auto rhsType = sema.typeOf(expr->rhs.get());
+        if(!rhsType || rhsType->isError()) return {};
+
+        auto rhs = lowerExpr(expr->rhs.get(), nullptr);
+        if(terminated() || rhs.type == nullptr) return {};
+
+        auto lhsAddr = lowerPlace(expr->lhs.get());
+        if(lhsAddr.type == nullptr) return {};
+
+        auto typ = irType(lhsType);
+        if(typ == nullptr || typ->kind == IRKind::Void) return {};
+
+        if(rhsType->kind == SemKind::Ref) {
+            if(rhsType->isMut) return {};
+            IRType *innerType = irType(rhsType->inner);
+            if(innerType == nullptr || innerType->kind == IRKind::Void) return {};
+            rhs = emitLoad(innerType, rhs);
+        }
+
+        auto val = emitLoad(typ, lhsAddr);
+        auto ret = emitCompoundAssign(expr->op, val, rhs, lhsType);
+        if(ret.type == nullptr) return {};
+        emitStore(ret, lhsAddr, typ);
+        return {};
+    }
 }
 
 IRValue Lower::lowerFieldExpr(FieldExpr *expr, const SemTypePtr &expected) {
@@ -1652,26 +1764,187 @@ IRValue Lower::lowerReturnExpr(ReturnExpr *expr, const SemTypePtr &expected) {
 }
 
 IRValue Lower::lowerBreakExpr(BreakExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
+    if(loopStack.empty()) return {};
+
+    LoopCtx &ctx = loopStack.back();
+    if(expr->val == nullptr) {
+        emitBr(ctx.breakBlock);
+        return {};
+    }
+
+    if(ctx.isWhile || !ctx.hasResult || !ctx.resultType) {
+        return {};
+    }
+
+    IRValue value = lowerExpr(expr->val.get(), ctx.resultType);
+    if(terminated() || value.type == nullptr) return {};
+
+    value = coerce(value, sema.typeOf(expr->val.get()), ctx.resultType);
+    if(terminated() || value.type == nullptr) return {};
+
+    IRType *resultIR = irType(ctx.resultType);
+    if(resultIR == nullptr || resultIR->kind == IRKind::Void) return {};
+
+    if(isAggregateType(resultIR)) {
+        emitMemcpy(ctx.resultSlot, value, resultIR->size);
+    }
+    else {
+        emitStore(value, ctx.resultSlot, resultIR);
+    }
+
+    emitBr(ctx.breakBlock);
     return {};
 }
 
 IRValue Lower::lowerContinueExpr(ContinueExpr *expr, const SemTypePtr &expected) {
     (void)expr;
     (void)expected;
+    if(loopStack.empty()) return {};
+    emitBr(loopStack.back().continueBlock);
     return {};
 }
 
 IRValue Lower::lowerIfExpr(IfExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+
+    auto cond = lowerExpr(expr->cond.get(), SemType::make(SemKind::Bool));
+    if(terminated() || cond.type == nullptr) return {};
+
+    auto resultType = sema.typeOf(expr);
+    if(!resultType || resultType->isError()) return {};
+
+    bool hasResult = resultType->kind != SemKind::Unit &&
+                     resultType->kind != SemKind::Never;
+    IRType *resultIR = nullptr;
+    IRValue slot;
+    if(hasResult) {
+        resultIR = irType(resultType);
+        if(resultIR == nullptr || resultIR->kind == IRKind::Void) {
+            return {};
+        }
+        slot = emitAlloca(resultIR);
+    }
+
+    size_t thenBlock = newBlock("if.then");
+    size_t mergeBlock = newBlock("if.merge");
+    size_t elseBlock = expr->elseBranch ? newBlock("if.else") : mergeBlock;
+
+    emitCondBr(cond, thenBlock, elseBlock);
+
+    bool reachesMerge = !expr->elseBranch;
+
+    switchBlock(thenBlock);
+    IRValue thenVal = lowerBlockExpr(expr->thenBlock.get(),
+                                     hasResult ? resultType : nullptr);
+    if(!terminated()) {
+        if(hasResult) {
+            if(thenVal.type == nullptr) return {};
+            SemTypePtr thenType = expr->thenBlock->tail ? sema.typeOf(expr->thenBlock->tail.get()) : nullptr;
+            thenVal = coerce(thenVal, thenType, resultType);
+            if(terminated() || thenVal.type == nullptr) return {};
+
+            if(isAggregateType(resultIR)) {
+                emitMemcpy(slot, thenVal, resultIR->size);
+            }
+            else {
+                emitStore(thenVal, slot, resultIR);
+            }
+        }
+        emitBr(mergeBlock);
+        reachesMerge = true;
+    }
+
+    if(expr->elseBranch) {
+        switchBlock(elseBlock);
+        IRValue elseVal = lowerExpr(expr->elseBranch.get(), hasResult ? resultType : nullptr);
+        if(!terminated()) {
+            if(hasResult) {
+                if(elseVal.type == nullptr) return {};
+                elseVal = coerce(elseVal, sema.typeOf(expr->elseBranch.get()), resultType);
+                if(terminated() || elseVal.type == nullptr) return {};
+
+                if(isAggregateType(resultIR)) {
+                    emitMemcpy(slot, elseVal, resultIR->size);
+                }
+                else {
+                    emitStore(elseVal, slot, resultIR);
+                }
+            }
+            emitBr(mergeBlock);
+            reachesMerge = true;
+        }
+    }
+
+    if(!reachesMerge) {
+        switchBlock(mergeBlock);
+        emitUnreachable();
+        return {};
+    }
+
+    switchBlock(mergeBlock);
+    if(!hasResult) {
+        return {};
+    }
+
+    if(isAggregateType(resultIR)) {
+        return slot;
+    }
+    return emitLoad(resultIR, slot);
 }
 
 IRValue Lower::lowerWhileExpr(WhileExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
+
+    auto resultType = sema.typeOf(expr);
+    if(!resultType || resultType->isError()) {
+        return {};
+    }
+
+    size_t condBlock = newBlock("while.cond");
+    size_t bodyBlock = newBlock("while.body");
+    size_t exitBlock = newBlock("while.exit");
+
+    emitBr(condBlock);
+    switchBlock(condBlock);
+    auto cond = lowerExpr(expr->cond.get(), SemType::make(SemKind::Bool));
+    if(terminated()) {
+        switchBlock(bodyBlock);
+        emitUnreachable();
+        switchBlock(exitBlock);
+        emitUnreachable();
+        return {};
+    }
+    if(cond.type == nullptr) {
+        if(!terminated()) {
+            emitUnreachable();
+        }
+        switchBlock(bodyBlock);
+        emitUnreachable();
+        switchBlock(exitBlock);
+        emitUnreachable();
+        return {};
+    }
+
+    emitCondBr(cond, bodyBlock, exitBlock);
+    switchBlock(bodyBlock);
+    LoopCtx ctx;
+    ctx.breakBlock = exitBlock;
+    ctx.continueBlock = condBlock;
+    ctx.isWhile = true;
+    ctx.hasResult = false;
+    ctx.resultSlot = {};
+    ctx.resultType = nullptr;
+    loopStack.push_back(ctx);
+
+    lowerBlockExpr(expr->body.get(), SemType::makeUnit());
+    loopStack.pop_back();
+
+    if(!terminated()) {
+        emitBr(condBlock);
+    }
+
+    switchBlock(exitBlock);
     return {};
 }
 
@@ -1864,9 +2137,24 @@ IRValue Lower::lowerMethodCallExpr(MethodCallExpr *expr, const SemTypePtr &expec
 }
 
 IRValue Lower::lowerCastExpr(CastExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
     (void)expected;
-    return {};
+    auto srcType = sema.typeOf(expr->expr.get());
+    auto dstType = sema.typeOf(expr);
+    if(!srcType || !dstType || srcType->isError() || dstType->isError()) {
+        return {};
+    }
+    IRValue val = lowerExpr(expr->expr.get(), nullptr);
+    if(terminated() || val.type == nullptr) {
+        return {};
+    }
+    if(srcType->isInteger() && dstType->isInteger()) {
+        //no-op , i32->i32
+        return val;
+    }
+    if(srcType->isBool() && dstType->isInteger()) {
+        return emitZext(val, irType(dstType));
+    }
+    return {};//invalid
 }
 
 IRValue Lower::lowerUnitExpr(UnitExpr *expr, const SemTypePtr &expected) {
@@ -1923,3 +2211,4 @@ IRGlobal *Lower::getFmtGlobal(const std::string &str, const std::string &name) {
     module.globals.push_back(std::move(global));
     return raw;
 }
+} // namespace rx::ir

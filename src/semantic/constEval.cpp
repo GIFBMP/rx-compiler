@@ -1,6 +1,8 @@
 #include "constEval.h"
 #include "analyzer.h"
 #include <optional>
+namespace rx::semantic {
+using namespace rx::ast;
 
 std::optional<ConstValue> ConstEvaluator::eval(const Expr *expr) {
     switch(expr->typ) {
@@ -77,3 +79,4 @@ std::optional<ConstValue> ConstEvaluator::evalConst(const Symbol *sym) {
     }
     return ret;
 }
+} // namespace rx::semantic

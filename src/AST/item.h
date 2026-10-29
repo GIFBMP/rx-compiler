@@ -3,6 +3,7 @@
 #include "expr.h"
 #include <string>
 #include <vector>
+namespace rx::ast {
 
 struct UseDecItem : public Item {
     std::string raw;
@@ -53,3 +54,4 @@ struct ImplItem : public Item {
     std::vector<NodePtr<Item>> items;
     explicit ImplItem(SourceSpan span) : Item(NodeType::ImplItem, span) {}
 };
+} // namespace rx::ast

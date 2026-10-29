@@ -6,6 +6,7 @@
 #include "antlr4-runtime.h"
 #include "../grammar/RxLexer.h"
 #include <exception>
+namespace rx::ast {
 
 UnaryOp AstBuilder::toUnaryOp(RxParser::UnaryOperatorContext *ctx) {
     if(ctx->AMP() && ctx->MUT()) return UnaryOp::RefMut;
@@ -2040,3 +2041,4 @@ NodePtr<StructExprField> AstBuilder::buildStructExprField(RxParser::StructExprFi
     ret->value = buildExpr(ctx->expression());
     return ret;
 }
+} // namespace rx::ast

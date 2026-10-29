@@ -4,6 +4,18 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+namespace rx::ir {
+using namespace rx::ast;
+using namespace rx::semantic;
+
+struct LoopCtx {
+    size_t breakBlock = 0;
+    size_t continueBlock = 0;
+    bool isWhile = false;
+    bool hasResult = false;
+    IRValue resultSlot;
+    SemTypePtr resultType;
+};
 
 class Lower {
 public:
@@ -45,6 +57,7 @@ private:
     std::vector<SemTypePtr> pendingEqTypes;
     size_t eqHelperCounter = 0;
     std::vector<FuncCtx> ctxStack;
+    std::vector<LoopCtx> loopStack;
 
     IRType *irType(const SemTypePtr &t);
     IRStruct *irStruct(const StructDefItem *def);
@@ -62,6 +75,7 @@ private:
     void emitStore(IRValue value, IRValue ptr, IRType *type);
     IRValue emitGep(IRType *baseType, IRValue ptr,
                     const std::vector<IRValue> &indices);
+    IRValue emitZext(IRValue value, IRType *type);
     IRValue emitBinaryOp(IROp op, IRValue lhs, IRValue rhs);
     IRValue emitICmp(IRCmp cmp, IRValue lhs, IRValue rhs);
     void emitBr(size_t target);
@@ -71,6 +85,7 @@ private:
     void emitMemmove(IRValue dst, IRValue src, IRValue size);
     IRValue emitCall(const std::string &calleeName, IRType *retType,
                      const std::vector<IRValue> &args, bool varArg = false);
+    IRValue emitCompoundAssign(AssignOp op, IRValue lhs, IRValue rhs, SemTypePtr type);
 
     bool terminated() const;
     const Symbol *declSymbol(const AstNode *node) const;
@@ -142,3 +157,4 @@ private:
 
     IRGlobal *getFmtGlobal(const std::string &str, const std::string &name);
 };
+} // namespace rx::ir

@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+namespace rx::ast {
 
 class AstBuilder {
 public:
@@ -179,3 +180,4 @@ private:
         RxParser::StructExprFieldsContext *ctx);
     NodePtr<StructExprField> buildStructExprField(RxParser::StructExprFieldContext *ctx);
 };
+} // namespace rx::ast

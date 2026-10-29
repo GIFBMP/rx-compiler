@@ -1,6 +1,7 @@
 #pragma once
 #include "AstNode.h"
 #include <string>
+namespace rx::ast {
 
 struct LetStmt : public Stmt {
     std::string name;
@@ -19,3 +20,4 @@ struct ExprStmt : public Stmt {
 struct NullStmt : public Stmt {
     explicit NullStmt(SourceSpan span) : Stmt(NodeType::NullStmt, span) {}
 };
+} // namespace rx::ast

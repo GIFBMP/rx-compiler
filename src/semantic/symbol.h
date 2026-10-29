@@ -2,6 +2,8 @@
 #include "../AST/AstNode.h"
 #include "semtype.h"
 #include <string>
+namespace rx::semantic {
+using namespace rx::ast;
 
 enum class SymbolKind {
     Local,       //let
@@ -26,3 +28,4 @@ struct Symbol {
     bool isPlace = false;  //is assignable(eg. local/param)
     bool isSelf = false;
 };
+} // namespace rx::semantic

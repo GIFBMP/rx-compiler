@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+namespace rx::semantic {
+using namespace rx::ast;
 
 struct Diagnostic {
     SourceSpan span;
@@ -167,3 +169,4 @@ private:
     const StructDefItem *currentImplSelf = nullptr;
     SemTypePtr currentFuncRet;
 };
+} // namespace rx::semantic

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+namespace rx::ir {
 
 enum class IRKind {
     Void, 
@@ -235,3 +236,4 @@ struct IRModule {
     std::vector<std::unique_ptr<IRFunc>> funcs;
     std::vector<std::unique_ptr<IRGlobal>> globals;
 };
+} // namespace rx::ir

@@ -2,6 +2,7 @@
 #include "AstNode.h"
 #include <string>
 #include <vector>
+namespace rx::ast {
 
 struct BoolExpr : public Expr {
     bool val = false;
@@ -142,3 +143,4 @@ struct GroupExpr : public Expr {
     NodePtr<Expr> inner;
     explicit GroupExpr(SourceSpan span) : Expr(NodeType::GroupExpr, span) {}
 };
+} // namespace rx::ast

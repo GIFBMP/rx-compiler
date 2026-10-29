@@ -3,6 +3,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+namespace rx::ir {
 
 namespace {
 
@@ -222,6 +223,14 @@ bool emitInstr(const IRInstr &instr, std::ostream &out) {
             out << "\n";
             return true;
         }
+        case IROp::Zext: {
+            if(!instr.hasDst || instr.args.empty()) return false;
+            out << "  " << valueName(instr.dst) << " = zext "
+                << typeName(instr.args[0].type) << " "
+                << valueName(instr.args[0]) << " to "
+                << typeName(instr.type) << "\n";
+            return true;
+        }
         case IROp::Add:
         case IROp::Sub:
         case IROp::Mul:
@@ -408,3 +417,4 @@ bool LLVMEmit::emit(const IRModule &module, std::ostream &out) {
 
     return true;
 }
+} // namespace rx::ir
