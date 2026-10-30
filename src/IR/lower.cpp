@@ -24,6 +24,9 @@ IRModule Lower::lower(Crate *crate) {
     eqHelperNames.clear();
     pendingEqTypes.clear();
     eqHelperCounter = 0;
+    cloneHelperNames.clear();
+    pendingCloneTypes.clear();
+    cloneHelperCounter = 0;
     ctxStack.clear();
     loopStack.clear();
 
@@ -67,6 +70,7 @@ IRModule Lower::lower(Crate *crate) {
     }
 
     generateEqHelpers();
+    generateCloneHelpers();
     return std::move(module);
 }
 
@@ -317,6 +321,16 @@ IRValue Lower::emitICmp(IRCmp cmp, IRValue lhs, IRValue rhs) {
     instr.args.push_back(rhs);
     emit(instr);
     return instr.dst;
+}
+
+IRValue Lower::emitMalloc(IRValue size) {
+    assert(size.type != nullptr);
+    assert(size.type->kind == IRKind::I32);
+    return emitCall("malloc", types.ptr(), {size}, false);
+}
+
+IRValue Lower::emitMalloc(size_t size) {
+    return emitMalloc(makeIRInt(static_cast<long long>(size)));
 }
 
 IRValue Lower::emitZext(IRValue value, IRType *type) {
@@ -1358,6 +1372,277 @@ void Lower::generateBoxEqHelper(const SemTypePtr &type) {
     }
 }
 
+std::string Lower::ensureCloneHelper(const SemTypePtr &type) {
+    std::string key = typeKey(type);
+    auto it = cloneHelperNames.find(key);
+    if(it != cloneHelperNames.end()) {
+        return it->second;
+    }
+
+    std::string name = "__rx_clone$" + std::to_string(cloneHelperCounter);
+    cloneHelperCounter++;
+    cloneHelperNames[key] = name;
+    pendingCloneTypes.push_back(type);
+    return name;
+}
+
+void Lower::emitCloneCall(const SemTypePtr &type, IRValue src, IRValue dst) {
+    std::string name = ensureCloneHelper(type);
+    emitCall(name, types.voidType(), {src, dst}, false);
+}
+
+void Lower::cloneInto(const SemTypePtr &type, IRValue src, IRValue dst) {
+    if(!type) return;
+
+    IRType *ir = irType(type);
+    if(ir == nullptr || ir->kind == IRKind::Void) return;
+
+    if(type->isInteger() || type->isBool()) {
+        IRValue value = emitLoad(ir, src);
+        emitStore(value, dst, ir);
+        return;
+    }
+
+    if(type->kind == SemKind::Ref) {
+        IRValue value = emitLoad(types.ptr(), src);
+        emitStore(value, dst, types.ptr());
+        return;
+    }
+
+    switch(type->kind) {
+        case SemKind::Struct:
+        case SemKind::Array:
+        case SemKind::Box:
+        case SemKind::Vec:
+            emitCloneCall(type, src, dst);
+            return;
+        default:
+            return;
+    }
+}
+
+void Lower::generateCloneHelpers() {
+    for(size_t i = 0; i < pendingCloneTypes.size(); i++) {
+        SemTypePtr type = pendingCloneTypes[i];
+        auto it = cloneHelperNames.find(typeKey(type));
+        if(it == cloneHelperNames.end()) {
+            continue;
+        }
+
+        pushFuncCtx();
+
+        auto func = std::make_unique<IRFunc>();
+        func->name = it->second;
+        func->retType = types.voidType();
+        module.funcs.push_back(std::move(func));
+        curFunc = module.funcs.back().get();
+
+        nxReg = 0;
+        curBlock = 0;
+        locals.clear();
+        curFuncIsMain = false;
+        curFuncRet = nullptr;
+        curAggRet = false;
+        curSret = {};
+        curBlock = newBlock("entry");
+
+        IRValue src = newReg(types.ptr());
+        IRValue dst = newReg(types.ptr());
+        curFunc->params.push_back(src);
+        curFunc->params.push_back(dst);
+
+        switch(type->kind) {
+            case SemKind::Struct:
+                generateStructCloneHelper(type);
+                break;
+            case SemKind::Array:
+                generateArrayCloneHelper(type);
+                break;
+            case SemKind::Vec:
+                generateVecCloneHelper(type);
+                break;
+            case SemKind::Box:
+                generateBoxCloneHelper(type);
+                break;
+            default:
+                break;
+        }
+
+        if(!terminated()) {
+            emitRet();
+        }
+        popFuncCtx();
+    }
+}
+
+void Lower::generateStructCloneHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Struct || type->structDef == nullptr) {
+        return;
+    }
+
+    auto it = sema.structs.find(type->structDef);
+    if(it == sema.structs.end()) {
+        return;
+    }
+
+    IRStruct *info = irStruct(type->structDef);
+    IRType *structType = irType(type);
+    if(info == nullptr || structType == nullptr) {
+        return;
+    }
+
+    IRValue src = curFunc->params[0];
+    IRValue dst = curFunc->params[1];
+    IRValue zero = makeIRInt(0, types.i32());
+
+    for(size_t i = 0; i < it->second.fields.size(); i++) {
+        IRValue index = makeIRInt(static_cast<long long>(i), types.i32());
+        std::vector<IRValue> indices{zero, index};
+
+        IRValue srcField = emitGep(structType, src, indices);
+        IRValue dstField = emitGep(structType, dst, indices);
+        cloneInto(it->second.fields[i].type, srcField, dstField);
+    }
+
+    emitRet();
+}
+
+void Lower::generateArrayCloneHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Array || type->elem == nullptr) {
+        return;
+    }
+
+    IRType *arrayType = irType(type);
+    if(arrayType == nullptr) {
+        return;
+    }
+
+    IRValue src = curFunc->params[0];
+    IRValue dst = curFunc->params[1];
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue one = makeIRInt(1, types.i32());
+
+    IRValue indexSlot = emitAlloca(types.i32());
+    emitStore(zero, indexSlot, types.i32());
+
+    size_t loopBlock = newBlock("clone.array.loop");
+    size_t bodyBlock = newBlock("clone.array.body");
+    size_t doneBlock = newBlock("clone.array.done");
+
+    emitBr(loopBlock);
+
+    switchBlock(loopBlock);
+    IRValue index = emitLoad(types.i32(), indexSlot);
+    IRValue cond = emitICmp(IRCmp::Ult, index,
+                            makeIRInt(static_cast<long long>(type->arrayLen), types.i32()));
+    emitCondBr(cond, bodyBlock, doneBlock);
+
+    switchBlock(bodyBlock);
+    std::vector<IRValue> indices{zero, index};
+    IRValue srcElem = emitGep(arrayType, src, indices);
+    IRValue dstElem = emitGep(arrayType, dst, indices);
+    cloneInto(type->elem, srcElem, dstElem);
+
+    IRValue nextIndex = emitBinaryOp(IROp::Add, index, one);
+    emitStore(nextIndex, indexSlot, types.i32());
+    emitBr(loopBlock);
+
+    switchBlock(doneBlock);
+    emitRet();
+}
+
+void Lower::generateVecCloneHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Vec || type->inner == nullptr) {
+        return;
+    }
+
+    IRType *headerType = irType(type);
+    IRType *elemIR = irType(type->inner);
+    if(headerType == nullptr || elemIR == nullptr ||
+       elemIR->kind == IRKind::Void || elemIR->size == 0) {
+        return;
+    }
+
+    IRValue src = curFunc->params[0];
+    IRValue dst = curFunc->params[1];
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue one = makeIRInt(1, types.i32());
+    IRValue two = makeIRInt(2, types.i32());
+
+    IRValue srcLenAddr = emitGep(headerType, src, {zero, one});
+    IRValue len = emitLoad(types.i32(), srcLenAddr);
+
+    IRValue dstDataAddr = emitGep(headerType, dst, {zero, zero});
+    IRValue dstLenAddr = emitGep(headerType, dst, {zero, one});
+    IRValue dstCapAddr = emitGep(headerType, dst, {zero, two});
+
+    IRValue null;
+    null.kind = IRValueKind::Null;
+    null.type = types.ptr();
+    emitStore(null, dstDataAddr, types.ptr());
+    emitStore(len, dstLenAddr, types.i32());
+    emitStore(len, dstCapAddr, types.i32());
+
+    size_t dataBlock = newBlock("clone.vec.data");
+    size_t doneBlock = newBlock("clone.vec.done");
+    IRValue isEmpty = emitICmp(IRCmp::Eq, len, zero);
+    emitCondBr(isEmpty, doneBlock, dataBlock);
+
+    switchBlock(dataBlock);
+    IRValue srcDataAddr = emitGep(headerType, src, {zero, zero});
+    IRValue srcData = emitLoad(types.ptr(), srcDataAddr);
+    IRValue bytes = emitBinaryOp(
+        IROp::Mul,
+        len,
+        makeIRInt(static_cast<long long>(elemIR->size), types.i32())
+    );
+    IRValue dstData = emitMalloc(bytes);
+    emitStore(dstData, dstDataAddr, types.ptr());
+
+    IRValue indexSlot = emitAlloca(types.i32());
+    emitStore(zero, indexSlot, types.i32());
+
+    size_t loopBlock = newBlock("clone.vec.loop");
+    size_t bodyBlock = newBlock("clone.vec.body");
+    emitBr(loopBlock);
+
+    switchBlock(loopBlock);
+    IRValue index = emitLoad(types.i32(), indexSlot);
+    IRValue inRange = emitICmp(IRCmp::Ult, index, len);
+    emitCondBr(inRange, bodyBlock, doneBlock);
+
+    switchBlock(bodyBlock);
+    IRValue srcElem = emitGep(elemIR, srcData, {index});
+    IRValue dstElem = emitGep(elemIR, dstData, {index});
+    cloneInto(type->inner, srcElem, dstElem);
+
+    IRValue nextIndex = emitBinaryOp(IROp::Add, index, one);
+    emitStore(nextIndex, indexSlot, types.i32());
+    emitBr(loopBlock);
+
+    switchBlock(doneBlock);
+    emitRet();
+}
+
+void Lower::generateBoxCloneHelper(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Box || type->inner == nullptr) {
+        return;
+    }
+
+    IRType *innerIR = irType(type->inner);
+    if(innerIR == nullptr || innerIR->kind == IRKind::Void || innerIR->size == 0) {
+        return;
+    }
+
+    IRValue src = curFunc->params[0];
+    IRValue dst = curFunc->params[1];
+    IRValue oldPtr = emitLoad(types.ptr(), src);
+    IRValue newPtr = emitMalloc(innerIR->size);
+    cloneInto(type->inner, oldPtr, newPtr);
+    emitStore(newPtr, dst, types.ptr());
+    emitRet();
+}
+
 IRValue Lower::lowerEqAddress(Expr *expr, SemTypePtr type) {
     if(type->kind == SemKind::Struct || type->kind == SemKind::Array || type->kind == SemKind::Vec) {
         //aggregate
@@ -2369,13 +2654,538 @@ IRValue Lower::lowerFuncCall(CallExpr *expr, Symbol *callee, const FuncSig &sig)
 }
 
 IRValue Lower::lowerBuiltinFunc(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op) {
+    switch(op) {
+        case BuiltinOp::VecPush:
+            return lowerVecPush(expr, callee, sig);
+        case BuiltinOp::VecClone:
+            return lowerVecClone(expr, callee, sig);
+        case BuiltinOp::VecLen:
+            return lowerVecLen(expr, callee, sig);
+        case BuiltinOp::VecIsEmpty:
+            return lowerVecIsEmpty(expr, callee, sig);
+        case BuiltinOp::VecRemove:
+            return lowerVecRemove(expr, callee, sig);
+        case BuiltinOp::VecNew:
+            return lowerVecNew(expr, callee, sig);
+        case BuiltinOp::BoxNew:
+            return lowerBoxNew(expr, callee, sig);
+        case BuiltinOp::BoxClone:
+            return lowerBoxClone(expr, callee, sig);
+        case BuiltinOp::Clone:
+            return lowerClone(expr, callee, sig);
+        case BuiltinOp::ArrayLen:
+            return lowerArrayLen(expr, callee, sig);
+        default:
+            return {};
+    }
+}
+
+IRValue Lower::lowerBoxNew(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    (void)callee;
+    if(expr == nullptr || expr->args.empty() || sig.params.empty()) return {};
+
+    const SemTypePtr &elemType = sig.params[0];
+    IRType *elemIR = irType(elemType);
+    if(elemIR == nullptr || elemIR->kind == IRKind::Void || elemIR->size == 0) {
+        return {};
+    }
+
+    IRValue value = lowerExpr(expr->args[0].get(), elemType);
+    if(terminated() || value.type == nullptr) return {};
+
+    value = coerce(value, sema.typeOf(expr->args[0].get()), elemType);
+    if(terminated() || value.type == nullptr) return {};
+
+    IRValue raw = emitMalloc(elemIR->size);
+    if(isAggregateType(elemIR)) {
+        emitMemcpy(raw, value, elemIR->size);
+    }
+    else {
+        emitStore(value, raw, elemIR);
+    }
+    return raw;
+}
+
+IRValue Lower::lowerBoxCloneFrom(const SemTypePtr &boxType, IRValue recv) {
+    if(!boxType || boxType->kind != SemKind::Box || !boxType->inner) return {};
+
+    IRType *elemIR = irType(boxType->inner);
+    if(elemIR == nullptr || elemIR->kind == IRKind::Void || elemIR->size == 0) {
+        return {};
+    }
+
+    IRValue oldPtr = emitLoad(types.ptr(), recv);
+    IRValue newPtr = emitMalloc(elemIR->size);
+    cloneInto(boxType->inner, oldPtr, newPtr);
+    return newPtr;
+}
+
+IRValue Lower::lowerBoxClone(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    (void)callee;
+    if(expr == nullptr || expr->args.empty()) return {};
+
+    auto boxType = sema.typeOf(expr);
+    if(!boxType || boxType->kind != SemKind::Box || !boxType->inner) return {};
+
+    SemTypePtr recvType = SemType::makeRef(boxType, sig.selfMut);
+    IRValue recv = lowerExpr(expr->args[0].get(), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    recv = coerce(recv, sema.typeOf(expr->args[0].get()), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    return lowerBoxCloneFrom(boxType, recv);
+}
+
+IRValue Lower::lowerVecNew(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
     (void)expr;
     (void)callee;
     (void)sig;
-    (void)op;
+
+    IRType *vecIR = types.vecHeader();
+    auto slot = emitAlloca(vecIR);
+    auto zero = makeIRInt(0, types.i32());
+    auto one = makeIRInt(1, types.i32());
+    auto two = makeIRInt(2, types.i32());
+
+    IRValue dataAddr = emitGep(vecIR, slot, {zero, zero});
+    IRValue null;
+    null.kind = IRValueKind::Null;
+    null.type = types.ptr();
+    emitStore(null, dataAddr, types.ptr());
+
+    IRValue lenAddr = emitGep(vecIR, slot, {zero, one});
+    emitStore(zero, lenAddr, types.i32());
+
+    IRValue capAddr = emitGep(vecIR, slot, {zero, two});
+    emitStore(zero, capAddr, types.i32());
+
+    return slot;
+}
+
+IRValue Lower::lowerVecCloneFrom(const SemTypePtr &vecType, IRValue recv) {
+    if(!vecType || vecType->kind != SemKind::Vec || !vecType->inner) return {};
+
+    IRValue out = emitAlloca(types.vecHeader());
+    cloneInto(vecType, recv, out);
+    return out;
+}
+
+IRValue Lower::lowerVecClone(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    (void)callee;
+    if(expr == nullptr || expr->args.empty()) return {};
+
+    auto vecType = sema.typeOf(expr);
+    if(!vecType || vecType->kind != SemKind::Vec || !vecType->inner) return {};
+
+    SemTypePtr recvType = SemType::makeRef(vecType, sig.selfMut);
+    IRValue recv = lowerExpr(expr->args[0].get(), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    recv = coerce(recv, sema.typeOf(expr->args[0].get()), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    return lowerVecCloneFrom(vecType, recv);
+}
+
+IRValue Lower::lowerVecHeaderArg(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    if(expr == nullptr || expr->args.empty()) return {};
+
+    SemTypePtr recvType = sig.selfByRef
+        ? SemType::makeRef(callee->type, sig.selfMut)
+        : callee->type;
+
+    IRValue header = lowerExpr(expr->args[0].get(), recvType);
+    if(terminated() || header.type == nullptr) return {};
+
+    header = coerce(header, sema.typeOf(expr->args[0].get()), recvType);
+    if(terminated() || header.type == nullptr) return {};
+    return header;
+}
+
+IRValue Lower::lowerVecLenFrom(IRValue header) {
+    if(header.type == nullptr) return {};
+
+    auto zero = makeIRInt(0, types.i32());
+    auto one = makeIRInt(1, types.i32());
+    IRValue lenAddr = emitGep(types.vecHeader(), header, {zero, one});
+    return emitLoad(types.i32(), lenAddr);
+}
+
+IRValue Lower::lowerVecLen(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    IRValue header = lowerVecHeaderArg(expr, callee, sig);
+    return lowerVecLenFrom(header);
+}
+
+IRValue Lower::lowerVecIsEmptyFrom(IRValue header) {
+    if(header.type == nullptr) return {};
+
+    auto zero = makeIRInt(0, types.i32());
+    auto one = makeIRInt(1, types.i32());
+    IRValue lenAddr = emitGep(types.vecHeader(), header, {zero, one});
+    IRValue len = emitLoad(types.i32(), lenAddr);
+    return emitICmp(IRCmp::Eq, len, zero);
+}
+
+IRValue Lower::lowerVecIsEmpty(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    IRValue header = lowerVecHeaderArg(expr, callee, sig);
+    return lowerVecIsEmptyFrom(header);
+}
+
+IRValue Lower::lowerVecPushFrom(IRValue header, Expr *valueExpr, const SemTypePtr &elemType) {
+    if(header.type == nullptr || valueExpr == nullptr || !elemType) return {};
+
+    IRType *elemIR = irType(elemType);
+    if(elemIR == nullptr || elemIR->kind == IRKind::Void || elemIR->size == 0) {
+        return {};
+    }
+
+    IRValue value = lowerExpr(valueExpr, elemType);
+    if(terminated() || value.type == nullptr) return {};
+
+    value = coerce(value, sema.typeOf(valueExpr), elemType);
+    if(terminated() || value.type == nullptr) return {};
+
+    IRValue valueSlot = value;
+    if(isAggregateType(elemIR)) {
+        valueSlot = emitAlloca(elemIR);
+        emitMemcpy(valueSlot, value, elemIR->size);
+    }
+
+    IRType *headerIR = types.vecHeader();
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue one = makeIRInt(1, types.i32());
+    IRValue two = makeIRInt(2, types.i32());
+
+    IRValue dataAddr = emitGep(headerIR, header, {zero, zero});
+    IRValue lenAddr = emitGep(headerIR, header, {zero, one});
+    IRValue capAddr = emitGep(headerIR, header, {zero, two});
+
+    IRValue len = emitLoad(types.i32(), lenAddr);
+    IRValue cap = emitLoad(types.i32(), capAddr);
+    IRValue enough = emitICmp(IRCmp::Ult, len, cap);
+
+    size_t growBlock = newBlock("vec.push.grow");
+    size_t storeBlock = newBlock("vec.push.store");
+    emitCondBr(enough, storeBlock, growBlock);
+
+    switchBlock(growBlock);
+    IRValue newCapSlot = emitAlloca(types.i32());
+    IRValue capIsZero = emitICmp(IRCmp::Eq, cap, zero);
+
+    size_t zeroCapBlock = newBlock("vec.push.zero_cap");
+    size_t doubleCapBlock = newBlock("vec.push.double_cap");
+    size_t resizeBlock = newBlock("vec.push.resize");
+    emitCondBr(capIsZero, zeroCapBlock, doubleCapBlock);
+
+    switchBlock(zeroCapBlock);
+    emitStore(makeIRInt(4, types.i32()), newCapSlot, types.i32());
+    emitBr(resizeBlock);
+
+    switchBlock(doubleCapBlock);
+    IRValue doubled = emitBinaryOp(
+        IROp::Mul,
+        cap,
+        makeIRInt(2, types.i32())
+    );
+    emitStore(doubled, newCapSlot, types.i32());
+    emitBr(resizeBlock);
+
+    switchBlock(resizeBlock);
+    IRValue newCap = emitLoad(types.i32(), newCapSlot);
+    IRValue bytes = emitBinaryOp(
+        IROp::Mul,
+        newCap,
+        makeIRInt(static_cast<long long>(elemIR->size), types.i32())
+    );
+    IRValue oldData = emitLoad(types.ptr(), dataAddr);
+    IRValue newData = emitCall("realloc", types.ptr(), {oldData, bytes}, false);
+    emitStore(newData, dataAddr, types.ptr());
+    emitStore(newCap, capAddr, types.i32());
+    emitBr(storeBlock);
+
+    switchBlock(storeBlock);
+    IRValue data = emitLoad(types.ptr(), dataAddr);
+    IRValue slot = emitGep(elemIR, data, {len});
+    if(isAggregateType(elemIR)) {
+        emitMemcpy(slot, valueSlot, elemIR->size);
+    }
+    else {
+        emitStore(valueSlot, slot, elemIR);
+    }
+
+    IRValue nextLen = emitBinaryOp(IROp::Add, len, one);
+    emitStore(nextLen, lenAddr, types.i32());
     return {};
 }
 
+IRValue Lower::lowerVecPush(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    if(expr == nullptr || expr->args.size() < 2 || callee == nullptr ||
+       !callee->type || callee->type->kind != SemKind::Vec || !callee->type->inner) {
+        return {};
+    }
+
+    IRValue header = lowerVecHeaderArg(expr, callee, sig);
+    if(header.type == nullptr) return {};
+
+    return lowerVecPushFrom(header, expr->args[1].get(), callee->type->inner);
+}
+
+IRValue Lower::lowerVecRemoveFrom(IRValue header, Expr *indexExpr,
+                                  const SemTypePtr &indexType, const SemTypePtr &elemType) {
+    if(header.type == nullptr || indexExpr == nullptr || !indexType || !elemType) {
+        return {};
+    }
+
+    IRType *elemIR = irType(elemType);
+    if(elemIR == nullptr || elemIR->kind == IRKind::Void || elemIR->size == 0) {
+        return {};
+    }
+
+    IRValue index = lowerExpr(indexExpr, indexType);
+    if(terminated() || index.type == nullptr) return {};
+
+    index = coerce(index, sema.typeOf(indexExpr), indexType);
+    if(terminated() || index.type == nullptr) return {};
+
+    IRType *headerIR = types.vecHeader();
+    IRValue zero = makeIRInt(0, types.i32());
+    IRValue one = makeIRInt(1, types.i32());
+
+    IRValue dataAddr = emitGep(headerIR, header, {zero, zero});
+    IRValue lenAddr = emitGep(headerIR, header, {zero, one});
+    IRValue len = emitLoad(types.i32(), lenAddr);
+    IRValue data = emitLoad(types.ptr(), dataAddr);
+    IRValue elemAddr = emitGep(elemIR, data, {index});
+
+    IRValue result;
+    if(isAggregateType(elemIR)) {
+        result = emitAlloca(elemIR);
+        emitMemcpy(result, elemAddr, elemIR->size);
+    }
+    else {
+        result = emitLoad(elemIR, elemAddr);
+    }
+
+    IRValue tail = emitBinaryOp(IROp::Sub, len, index);
+    tail = emitBinaryOp(IROp::Sub, tail, one);
+    IRValue bytes = emitBinaryOp(
+        IROp::Mul,
+        tail,
+        makeIRInt(static_cast<long long>(elemIR->size), types.i32())
+    );
+    IRValue nextIndex = emitBinaryOp(IROp::Add, index, one);
+    IRValue shiftSrc = emitGep(elemIR, data, {nextIndex});
+    IRValue shiftDst = emitGep(elemIR, data, {index});
+    emitMemmove(shiftDst, shiftSrc, bytes);
+
+    IRValue nextLen = emitBinaryOp(IROp::Sub, len, one);
+    emitStore(nextLen, lenAddr, types.i32());
+    return result;
+}
+
+IRValue Lower::lowerVecRemove(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    if(expr == nullptr || expr->args.size() < 2 || callee == nullptr ||
+       !callee->type || callee->type->kind != SemKind::Vec || !callee->type->inner ||
+       sig.params.empty()) {
+        return {};
+    }
+
+    IRValue header = lowerVecHeaderArg(expr, callee, sig);
+    if(header.type == nullptr) return {};
+
+    return lowerVecRemoveFrom(header, expr->args[1].get(), sig.params[0], callee->type->inner);
+}
+
+IRValue Lower::lowerCloneFrom(const SemTypePtr &type, IRValue recv) {
+    if(!type || recv.type == nullptr) return {};
+
+    IRType *ir = irType(type);
+    if(ir == nullptr || ir->kind == IRKind::Void) return {};
+
+    if(isAggregateType(ir)) {
+        IRValue out = emitAlloca(ir);
+        cloneInto(type, recv, out);
+        return out;
+    }
+
+    return emitLoad(ir, recv);
+}
+
+IRValue Lower::lowerClone(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    if(expr == nullptr || expr->args.empty() || callee == nullptr || !callee->type) {
+        return {};
+    }
+
+    SemTypePtr cloneType = callee->type;
+    SemTypePtr recvType = SemType::makeRef(cloneType, sig.selfMut);
+    IRValue recv = lowerExpr(expr->args[0].get(), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    recv = coerce(recv, sema.typeOf(expr->args[0].get()), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    return lowerCloneFrom(cloneType, recv);
+}
+
+IRValue Lower::lowerArrayLenFrom(const SemTypePtr &type) {
+    if(!type || type->kind != SemKind::Array) return {};
+    return makeIRInt(static_cast<long long>(type->arrayLen), types.i32());
+}
+
+IRValue Lower::lowerArrayLen(CallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    if(expr == nullptr || expr->args.empty() || callee == nullptr || !callee->type) {
+        return {};
+    }
+
+    SemTypePtr recvType = SemType::makeRef(callee->type, sig.selfMut);
+    IRValue recv = lowerExpr(expr->args[0].get(), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    recv = coerce(recv, sema.typeOf(expr->args[0].get()), recvType);
+    if(terminated() || recv.type == nullptr) return {};
+
+    return lowerArrayLenFrom(callee->type);
+}
+
+IRValue Lower::lowerMethodReceiver(MethodCallExpr *expr, Symbol *callee, const FuncSig &sig) {
+    if(expr == nullptr || expr->receiver == nullptr || callee == nullptr ||
+       !callee->type || !sig.hasSelf) {
+        return {};
+    }
+
+    Expr *recvExpr = expr->receiver.get();
+    SemTypePtr recvType = sema.typeOf(recvExpr);
+    if(!recvType || recvType->isError()) return {};
+
+    MethodAdjust adjust = sema.adjustOf(expr);
+    SemTypePtr target = callee->type;
+    SemTypePtr expected = sig.selfByRef
+        ? SemType::makeRef(target, sig.selfMut)
+        : target;
+
+    if(adjust.derefs == 0) {
+        if(sig.selfByRef) {
+            if(recvType->kind == SemKind::Ref && recvType->inner &&
+               sameType(recvType->inner, target)) {
+                IRValue val = lowerExpr(recvExpr, expected);
+                if(terminated() || val.type == nullptr) return {};
+                val = coerce(val, recvType, expected);
+                return (terminated() || val.type == nullptr) ? IRValue{} : val;
+            }
+
+            return lowerRef(recvExpr);
+        }
+
+        IRValue val = lowerExpr(recvExpr, expected);
+        if(terminated() || val.type == nullptr) return {};
+        return val;
+    }
+
+    IRValue value = lowerExpr(recvExpr, nullptr);
+    if(terminated() || value.type == nullptr) return {};
+
+    SemTypePtr cur = recvType;
+    IRValue addr;
+    for(int i = 0; i < adjust.derefs; i++) {
+        if(!cur || (cur->kind != SemKind::Ref && cur->kind != SemKind::Box)) break;
+
+        IRValue innerAddr = value;
+        cur = cur->inner;
+        if(!cur) return {};
+
+        IRType *curIR = irType(cur);
+        if(curIR == nullptr || curIR->kind == IRKind::Void) return {};
+
+        if(isAggregateType(curIR)) {
+            value = innerAddr;
+        }
+        else {
+            value = emitLoad(curIR, innerAddr);
+        }
+        addr = innerAddr;
+    }
+
+    if(!cur) return {};
+
+    if(sig.selfByRef) {
+        if(sameType(target, cur)) {
+            return addr;
+        }
+        if((cur->kind == SemKind::Ref || cur->kind == SemKind::Box) &&
+           cur->inner && sameType(target, cur->inner)) {
+            return value;
+        }
+        return value;
+    }
+
+    return value;
+}
+
+IRValue Lower::lowerMethodFuncCall(MethodCallExpr *expr, Symbol *callee,
+                                   const FuncSig &sig, IRValue recv) {
+    if(expr == nullptr || callee == nullptr || recv.type == nullptr) return {};
+
+    const StructDefItem *owner = memberOwner(callee);
+    std::string calleeName = owner ? owner->name + "." + callee->name : callee->name;
+
+    std::vector<IRValue> args;
+    args.reserve(sig.params.size() + 1);
+    args.push_back(recv);
+
+    for(size_t i = 0; i < sig.params.size(); i++) {
+        if(i >= expr->args.size()) return {};
+        Expr *argExpr = expr->args[i].get();
+        IRValue val = lowerExpr(argExpr, sig.params[i]);
+        if(terminated() || val.type == nullptr) return {};
+
+        val = coerce(val, sema.typeOf(argExpr), sig.params[i]);
+        if(terminated() || val.type == nullptr) return {};
+        args.push_back(val);
+    }
+
+    return emitCall(calleeName, irType(sig.ret), args, false);
+}
+
+IRValue Lower::lowerMethodCallExpr(MethodCallExpr *expr, const SemTypePtr &expected) {
+    (void)expected;
+    if(expr == nullptr) return {};
+
+    Symbol *sym = sema.symbolOf(expr);
+    if(sym == nullptr) return {};
+
+    auto sigIt = sema.sigs.find(sym);
+    if(sigIt == sema.sigs.end()) return {};
+    const FuncSig &sig = sigIt->second;
+
+    IRValue recv = lowerMethodReceiver(expr, sym, sig);
+    if(terminated() || recv.type == nullptr) return {};
+
+    auto op = sema.builtinOpOf(sym);
+    switch(op) {
+        case BuiltinOp::BoxClone:
+            return lowerBoxCloneFrom(sym->type, recv);
+        case BuiltinOp::VecClone:
+            return lowerVecCloneFrom(sym->type, recv);
+        case BuiltinOp::VecLen:
+            return lowerVecLenFrom(recv);
+        case BuiltinOp::VecIsEmpty:
+            return lowerVecIsEmptyFrom(recv);
+        case BuiltinOp::VecPush:
+            return lowerVecPushFrom(recv, expr->args[0].get(), sym->type->inner);
+        case BuiltinOp::VecRemove:
+            return lowerVecRemoveFrom(recv, expr->args[0].get(),
+                                      sig.params[0], sym->type->inner);
+        case BuiltinOp::Clone:
+            return lowerCloneFrom(sym->type, recv);
+        case BuiltinOp::ArrayLen:
+            return lowerArrayLenFrom(sym->type);
+        default:
+            break;
+    }
+
+    return lowerMethodFuncCall(expr, sym, sig, recv);
+}
 IRValue Lower::lowerCallExpr(CallExpr *expr, const SemTypePtr &expected) {
     (void)expected;
     auto sym = sema.symbolOf(expr->callee.get());
@@ -2407,11 +3217,6 @@ IRValue Lower::lowerCallExpr(CallExpr *expr, const SemTypePtr &expected) {
     return lowerFuncCall(expr, sym, sig);
 }
 
-IRValue Lower::lowerMethodCallExpr(MethodCallExpr *expr, const SemTypePtr &expected) {
-    (void)expr;
-    (void)expected;
-    return {};
-}
 
 IRValue Lower::lowerCastExpr(CastExpr *expr, const SemTypePtr &expected) {
     (void)expected;

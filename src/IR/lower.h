@@ -57,6 +57,9 @@ private:
     std::unordered_map<std::string, std::string> eqHelperNames;
     std::vector<SemTypePtr> pendingEqTypes;
     size_t eqHelperCounter = 0;
+    std::unordered_map<std::string, std::string> cloneHelperNames;
+    std::vector<SemTypePtr> pendingCloneTypes;
+    size_t cloneHelperCounter = 0;
     std::vector<FuncCtx> ctxStack;
     std::vector<LoopCtx> loopStack;
 
@@ -77,6 +80,8 @@ private:
     IRValue emitGep(IRType *baseType, IRValue ptr,
                     const std::vector<IRValue> &indices);
     IRValue emitZext(IRValue value, IRType *type);
+    IRValue emitMalloc(IRValue size);
+    IRValue emitMalloc(size_t size);
     IRValue emitBinaryOp(IROp op, IRValue lhs, IRValue rhs);
     IRValue emitICmp(IRCmp cmp, IRValue lhs, IRValue rhs);
     void emitBr(size_t target);
@@ -132,6 +137,13 @@ private:
     void generateVecEqHelper(const SemTypePtr &type);
     void generateRefEqHelper(const SemTypePtr &type);
     void generateBoxEqHelper(const SemTypePtr &type);
+    std::string ensureCloneHelper(const SemTypePtr &type);
+    void emitCloneCall(const SemTypePtr &type, IRValue src, IRValue dst);
+    void generateCloneHelpers();
+    void generateStructCloneHelper(const SemTypePtr &type);
+    void generateArrayCloneHelper(const SemTypePtr &type);
+    void generateVecCloneHelper(const SemTypePtr &type);
+    void generateBoxCloneHelper(const SemTypePtr &type);
     IRValue lowerBinaryExpr(BinaryExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerAssignExpr(AssignExpr *expr, const SemTypePtr &expected = nullptr);
     IRValue lowerFieldExpr(FieldExpr *expr, const SemTypePtr &expected = nullptr);
@@ -155,6 +167,32 @@ private:
 
     IRValue lowerBuiltinIO(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op);
     IRValue lowerBuiltinFunc(CallExpr *expr, Symbol *callee, const FuncSig &sig, BuiltinOp op);
+
+    IRValue lowerBoxNew(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    void cloneInto(const SemTypePtr &type, IRValue src, IRValue dst);
+    IRValue lowerBoxCloneFrom(const SemTypePtr &boxType, IRValue recv);
+    IRValue lowerBoxClone(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecNew(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecCloneFrom(const SemTypePtr &vecType, IRValue recv);
+    IRValue lowerVecClone(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecHeaderArg(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecLenFrom(IRValue header);
+    IRValue lowerVecLen(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecIsEmptyFrom(IRValue header);
+    IRValue lowerVecIsEmpty(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecPushFrom(IRValue header, Expr *valueExpr, const SemTypePtr &elemType);
+    IRValue lowerVecPush(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerVecRemoveFrom(IRValue header, Expr *indexExpr,
+                               const SemTypePtr &indexType, const SemTypePtr &elemType);
+    IRValue lowerVecRemove(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerCloneFrom(const SemTypePtr &type, IRValue recv);
+    IRValue lowerClone(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerArrayLenFrom(const SemTypePtr &type);
+    IRValue lowerArrayLen(CallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerMethodReceiver(MethodCallExpr *expr, Symbol *callee, const FuncSig &sig);
+    IRValue lowerMethodFuncCall(MethodCallExpr *expr, Symbol *callee,
+                                const FuncSig &sig, IRValue recv);
+
     IRValue lowerFuncCall(CallExpr *expr, Symbol *callee, const FuncSig &sig);
 
     IRValue coerce(IRValue val, const SemTypePtr &src, const SemTypePtr &dst);
